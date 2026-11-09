@@ -6,8 +6,8 @@ use std::str::FromStr;
 use anyhow::{Context as _, Result};
 
 use crate::schema::{
-    Condition, Duration, JumpToken, OrderList, OrderTyped, Schedule, ScheduleSlot, SlotSource,
-    Ticks, Timestamp, read_order_list,
+    Condition, Duration, JumpToken, OrderList, OrderTyped, Schedule, SlotSource, Ticks, Timestamp,
+    read_order_list,
 };
 
 #[derive(clap::Args)]
@@ -144,7 +144,14 @@ impl Args {
                 .enumerate()
                 .map(|(index, schedule)| {
                     Ok(ScheduleState {
-                        next_dispatch_slot: schedule
+                        assign_order:         order_list
+                            .orders
+                            .iter()
+                            .position(|order| order.schedule_index == Some(index))
+                            .with_context(|| {
+                                format!("schedule {} not assigned to any order", index + 1)
+                            })?,
+                        next_dispatch_slot:   schedule
                             .slots
                             .iter()
                             .enumerate()
@@ -157,25 +164,20 @@ impl Args {
                             .min_by_key(|&(_, timestamp)| timestamp)
                             .map(|(slot, _)| slot)
                             .unwrap_or(0),
-                        assign_order:       order_list
-                            .orders
-                            .iter()
-                            .position(|order| order.schedule_index == Some(index))
-                            .with_context(|| {
-                                format!("schedule {} not assigned to any order", index + 1)
-                            })?,
+                        dispatch_slot_cycles: Ticks(0),
+                        last_dispatch_time:   None,
                     })
                 })
                 .collect::<Result<_>>()?,
             vehicles:       Vec::new(),
         };
 
-        state.apply_initial(&ctx, &self.initial).context("apply initial vehicles")?;
+        state.apply_initial(&ctx, logger, &self.initial).context("apply initial vehicles")?;
 
         logger.step(order_list, start_time, &state);
 
         while let Some((cmp::Reverse(time), vehicle_id)) = state.scheduler_heap.pop() {
-            state.spin_once(&ctx, time, vehicle_id)?;
+            state.spin_once(&ctx, logger, time, vehicle_id)?;
             if state
                 .scheduler_heap
                 .peek()
@@ -196,6 +198,7 @@ impl Args {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct DisplayInfo {
     pub tpm:        Ticks,
     pub start_time: Ticks,
@@ -204,6 +207,8 @@ pub struct DisplayInfo {
 
 pub trait Logger {
     fn step(&mut self, order_list: &OrderList, time: Ticks, state: &State);
+
+    fn missed_dispatch_slot(&mut self, schedule_index: usize, slot: usize, time: Ticks);
 }
 
 struct Context<'a> {
@@ -221,33 +226,26 @@ pub struct State {
 }
 
 impl State {
-    fn apply_initial(&mut self, ctx: &Context, initial: &InitialVehicles) -> Result<()> {
-        for (((index, schedule), schedule_state), &num_vehicles) in
+    fn apply_initial(
+        &mut self,
+        ctx: &Context,
+        logger: &mut impl Logger,
+        initial: &InitialVehicles,
+    ) -> Result<()> {
+        for (((schedule_index, schedule), schedule_state), &num_vehicles) in
             ctx.order_list.schedules.iter().enumerate().zip(&mut self.schedules).zip(&initial.0)
         {
-            let num_slots = schedule.slots.len();
-            let mut next_dispatch_slot = {
-                || {
-                    anyhow::ensure!(
-                        num_slots > 0,
-                        "schedule {} has no slots and cannot hold initial vehicles",
-                        index + 1
-                    );
-                    let slot = schedule_state.next_dispatch_slot;
-                    schedule_state.next_dispatch_slot = (slot + 1) % num_slots;
-                    Ok(slot)
-                }
-            };
-
             for _ in 0..num_vehicles {
-                let dispatch_slot = next_dispatch_slot()?;
-                let dispatch_time = schedule.slots[dispatch_slot]
-                    .timestamp(schedule)
-                    .mod_start_time(ctx.start_time, ctx.day_length);
+                let (dispatch_slot, dispatch_time) = schedule_state.next_dispatch_slot(
+                    logger,
+                    schedule_index,
+                    schedule,
+                    ctx.start_time,
+                )?;
 
                 let vehicle_id = self.vehicles.len();
                 let mut schedule_slots = vec![None; schedule.slots.len()];
-                schedule_slots[index] = Some(dispatch_slot);
+                schedule_slots[schedule_index] = Some(dispatch_slot);
                 self.vehicles.push(Vehicle {
                     current_order: schedule_state.assign_order,
                     last_order: None,
@@ -260,7 +258,13 @@ impl State {
         Ok(())
     }
 
-    fn spin_once(&mut self, ctx: &Context, current_time: Ticks, vehicle_id: usize) -> Result<()> {
+    fn spin_once(
+        &mut self,
+        ctx: &Context,
+        logger: &mut impl Logger,
+        current_time: Ticks,
+        vehicle_id: usize,
+    ) -> Result<()> {
         let vehicle = &mut self.vehicles[vehicle_id];
         let eta = match vehicle.action {
             VehicleAction::Waiting | VehicleAction::PendingDispatch => {
@@ -276,12 +280,11 @@ impl State {
                         .schedules
                         .get(schedule_index)
                         .context("reference to invalid schedule")?;
-                    let (slot_index, slot) = self.schedules[schedule_index]
-                        .next_dispatch_slot(schedule)
+                    let (slot_index, eta) = self.schedules[schedule_index]
+                        .next_dispatch_slot(logger, schedule_index, schedule, current_time)
                         .context("acquire next dispatch slot")?;
                     vehicle.schedule_slots[schedule_index] = Some(slot_index);
 
-                    let eta = slot.timestamp(schedule).mod_start_time(current_time, ctx.day_length);
                     (eta, VehicleAction::PendingDispatch)
                 } else {
                     match order.typed {
@@ -304,21 +307,43 @@ impl State {
 }
 
 pub struct ScheduleState {
+    pub assign_order:         usize,
     // slot index is 0 if schedule is empty.
-    pub next_dispatch_slot: usize,
-    pub assign_order:       usize,
+    pub next_dispatch_slot:   usize,
+    pub dispatch_slot_cycles: Ticks,
+    pub last_dispatch_time:   Option<Ticks>,
 }
 
 impl ScheduleState {
-    fn next_dispatch_slot<'sched>(
+    fn next_dispatch_slot(
         &mut self,
-        schedule: &'sched Schedule,
-    ) -> Result<(usize, &'sched ScheduleSlot)> {
+        logger: &mut impl Logger,
+        schedule_index: usize,
+        schedule: &Schedule,
+        current_time: Ticks,
+    ) -> Result<(usize, Ticks)> {
         let num_slots = schedule.slots.len();
         anyhow::ensure!(num_slots > 0, "schedule has no slots and cannot dispatch vehicles");
-        let slot = self.next_dispatch_slot;
-        self.next_dispatch_slot = (slot + 1) % num_slots;
-        Ok((slot, &schedule.slots[self.next_dispatch_slot]))
+        loop {
+            let slot = self.next_dispatch_slot;
+            self.next_dispatch_slot += 1;
+            if self.next_dispatch_slot >= num_slots {
+                self.next_dispatch_slot = 0;
+            }
+            let slot_data = &schedule.slots[self.next_dispatch_slot];
+            let mut dispatch_time = slot_data.timestamp(schedule) + self.dispatch_slot_cycles;
+            if let Some(last) = self.last_dispatch_time
+                && dispatch_time <= last
+            {
+                self.dispatch_slot_cycles += schedule.duration;
+                dispatch_time += schedule.duration;
+            }
+            self.last_dispatch_time = Some(dispatch_time);
+            if dispatch_time + schedule.max_delay >= current_time {
+                return Ok((slot, dispatch_time.max(current_time)));
+            }
+            logger.missed_dispatch_slot(schedule_index, slot, dispatch_time);
+        }
     }
 }
 
@@ -448,5 +473,9 @@ impl Logger for StatsLogger {
             }
         }
         self.snapshots.push(snapshot);
+    }
+
+    fn missed_dispatch_slot(&mut self, schedule_index: usize, slot: usize, time: Ticks) {
+        println!("Missed dispatch slot: schedule {schedule_index}, slot {slot}, time {time:?}");
     }
 }

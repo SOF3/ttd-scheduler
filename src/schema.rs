@@ -58,7 +58,25 @@ pub enum OrderTyped {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+impl OrderTyped {
+    pub fn destination_name(&self) -> Option<&str> {
+        match self {
+            OrderTyped::GoToStation { destination_name, .. }
+            | OrderTyped::GoToWaypoint { destination_name, .. } => Some(destination_name),
+            OrderTyped::Conditional { .. } => None,
+        }
+    }
+
+    pub fn destination_location(&self) -> Option<Coords> {
+        match *self {
+            OrderTyped::GoToStation { destination_location, .. }
+            | OrderTyped::GoToWaypoint { destination_location, .. } => Some(destination_location),
+            OrderTyped::Conditional { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Coords {
     #[serde(rename = "X")]
     pub x: u32,
@@ -113,18 +131,18 @@ impl ScheduleSlot {
     Sub,
     SubAssign,
 )]
-pub struct Ticks(pub u32);
+pub struct Ticks(pub i32);
 
 impl ops::Mul<usize> for Ticks {
     type Output = Self;
 
-    fn mul(self, rhs: usize) -> Self::Output { Ticks(self.0 * u32::try_from(rhs).unwrap()) }
+    fn mul(self, rhs: usize) -> Self::Output { Ticks(self.0 * i32::try_from(rhs).unwrap()) }
 }
 
 impl ops::Div<usize> for Ticks {
     type Output = Self;
 
-    fn div(self, rhs: usize) -> Self::Output { Ticks(self.0 / u32::try_from(rhs).unwrap()) }
+    fn div(self, rhs: usize) -> Self::Output { Ticks(self.0 / i32::try_from(rhs).unwrap()) }
 }
 
 impl Ticks {

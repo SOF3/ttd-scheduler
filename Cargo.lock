@@ -3505,6 +3505,7 @@ dependencies = [
  "eframe",
  "egui",
  "itertools",
+ "num-traits",
  "rfd",
  "serde",
  "serde_json",

@@ -1,7 +1,11 @@
+use std::collections::VecDeque;
+use std::fmt::Display;
+use std::ops::{AddAssign, SubAssign};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use anyhow::Context;
-use egui::Margin;
+use egui::{Label, Margin, Rect, TextEdit, vec2};
 
 mod dispatch_flow;
 mod platform;
@@ -16,7 +20,11 @@ pub struct Command {
 
 impl Command {
     pub fn run(&self) -> anyhow::Result<()> {
-        let mut app = App { platform: Box::new(platform::Native), states: States::default() };
+        let mut app = App {
+            platform:    Box::new(platform::Native),
+            states:      States::default(),
+            fps_counter: VecDeque::new(),
+        };
         if let Some(file) = &self.file {
             app.states.file = Some((
                 file.clone(),
@@ -35,6 +43,8 @@ impl Command {
 struct App {
     platform: Box<dyn Platform>,
     states:   States,
+
+    fps_counter: VecDeque<f64>,
 }
 
 #[derive(Default)]
@@ -53,6 +63,20 @@ enum WhichTab {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        while let Some(pop) = self.fps_counter.front()
+            && ui.time() - pop > 1.0
+        {
+            self.fps_counter.pop_front();
+        }
+        self.fps_counter.push_back(ui.time());
+
+        if cfg!(feature = "render-fps") {
+            let fps =
+                self.fps_counter.len() as f64 / (ui.time() - self.fps_counter.front().unwrap());
+            let corner = ui.content_rect().right_top();
+            ui.add(Label::new(format!("FPS: {fps}")));
+        }
+
         egui::Frame::new().outer_margin(Margin::same(10)).show(ui, |ui| {
             self.choose_file(ui);
 
@@ -98,4 +122,54 @@ impl App {
             );
         }
     }
+}
+
+fn number_edit<N>(
+    ui: &mut egui::Ui,
+    string: &mut String,
+    value: &mut N,
+    min: Option<N>,
+    max: Option<N>,
+) where
+    N: FromStr + Display + Copy + num_traits::Num + AddAssign + SubAssign + PartialOrd,
+{
+    ui.scope(|ui| {
+        if !string.parse::<N>().is_ok() {
+            let visuals = &mut ui.style_mut().visuals;
+            visuals.text_edit_bg_color = Some(visuals.error_fg_color);
+        }
+
+        let resp = TextEdit::singleline(string).desired_width(40.0).show(ui);
+
+        if let Ok(parsed) = string.parse::<N>() {
+            *value = parsed;
+        }
+
+        let mut changed = false;
+        if resp.response.has_focus() {
+            ui.input_mut(|input| {
+                for _ in 0..input.count_and_consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                    if let Some(max) = max
+                        && *value < max
+                    {
+                        *value += N::one();
+                        changed = true;
+                    }
+                }
+                for _ in 0..input.count_and_consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+                {
+                    if let Some(min) = min
+                        && *value > min
+                    {
+                        *value -= N::one();
+                        changed = true;
+                    }
+                }
+            });
+        }
+
+        if resp.response.lost_focus() || changed {
+            *string = value.to_string();
+        }
+    });
 }
