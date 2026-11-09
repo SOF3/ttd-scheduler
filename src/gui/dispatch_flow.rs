@@ -1,6 +1,7 @@
 use std::mem;
 use std::path::PathBuf;
 
+use arrayvec::ArrayVec;
 use egui::{
     Align2, Color32, FontFamily, FontId, Painter, Popup, PopupKind, Pos2, Rect, ScrollArea, Slider,
     Stroke, Vec2, pos2, vec2,
@@ -9,6 +10,8 @@ use egui::{
 use crate::dispatch_flow::{self, DisplayInfo};
 use crate::gui::number_edit;
 use crate::schema::{Duration, OrderList, OrderTyped, Ticks, Timestamp};
+
+const ORDER_WRAP_THRESHOLD: f32 = 0.7;
 
 #[derive(Default)]
 pub struct State {
@@ -128,6 +131,7 @@ fn show_stringline(
     let resolution =
         plot_config.resolution(avbl_size, display, order_list, ui.next_widget_position());
     let (resp, painter) = ui.allocate_painter(avbl_size, egui::Sense::click());
+    let painter = painter.with_clip_rect(resp.rect.intersect(painter.clip_rect()));
     painter.rect_filled(resp.rect, 1.0, Color32::from_rgb(60, 80, 50));
 
     draw_hovered_crosshair(&painter, &resolution, &hovered.prev);
@@ -135,7 +139,18 @@ fn show_stringline(
     let vehicle_step_coord = |time: Ticks| {
         move |v: &VehicleStepLog| {
             let order = match v.lerp_last_order {
-                Some((prev, lerp)) => prev as f32 + lerp * (v.current_order as f32 - prev as f32),
+                Some((prev, lerp)) => {
+                    let cycle = resolution.num_orders as f32;
+                    let change = v.current_order as f32 - prev as f32;
+                    let change = if change > cycle * ORDER_WRAP_THRESHOLD {
+                        change - cycle
+                    } else if change < -cycle * ORDER_WRAP_THRESHOLD {
+                        change + cycle
+                    } else {
+                        change
+                    };
+                    (prev as f32 + lerp * change + 0.5).rem_euclid(cycle) - 0.5
+                }
                 None => v.current_order as f32,
             };
             resolution.tick_order_to_pos(time, order)
@@ -181,21 +196,42 @@ fn show_stringline(
                 stroke.color = Color32::from_rgb(220, 240, 80);
             }
 
-            painter.line_segment([prev_coords, next_coords], stroke);
+            let cycle = resolution.num_orders as f32 * resolution.px_per_order;
+            let offset = plot_config.orientation.vector(0.0, cycle);
+            let segments: ArrayVec<[Pos2; 2], 2> =
+                if plot_config.orientation.order(next_coords - prev_coords)
+                    > cycle * ORDER_WRAP_THRESHOLD
+                {
+                    [[prev_coords, next_coords - offset], [prev_coords + offset, next_coords]]
+                        .into_iter()
+                        .collect()
+                } else if plot_config.orientation.order(prev_coords - next_coords)
+                    > cycle * ORDER_WRAP_THRESHOLD
+                {
+                    [[prev_coords, next_coords + offset], [prev_coords - offset, next_coords]]
+                        .into_iter()
+                        .collect()
+                } else {
+                    [[prev_coords, next_coords]].into_iter().collect()
+                };
 
-            if let Some(hover) = resp.hover_pos()
-                && Rect::from_two_pos(prev_coords, next_coords).expand(10.0).contains(hover)
-            {
-                let dist = point_segment_dist_sq(hover, prev_coords, next_coords);
-                if nearest_hovered_segment.is_none_or(|(d, _)| d > dist) {
-                    nearest_hovered_segment = Some((
-                        dist,
-                        HoveredVehicle {
-                            vehicle:    veh_index,
-                            prev_order: veh_step.lerp_last_order,
-                            next_order: veh_step.current_order,
-                        },
-                    ));
+            for [prev_coords, next_coords] in segments {
+                painter.line_segment([prev_coords, next_coords], stroke);
+
+                if let Some(hover) = resp.hover_pos()
+                    && Rect::from_two_pos(prev_coords, next_coords).expand(10.0).contains(hover)
+                {
+                    let dist = point_segment_dist_sq(hover, prev_coords, next_coords);
+                    if nearest_hovered_segment.is_none_or(|(d, _)| d > dist) {
+                        nearest_hovered_segment = Some((
+                            dist,
+                            HoveredVehicle {
+                                vehicle:    veh_index,
+                                prev_order: veh_step.lerp_last_order,
+                                next_order: veh_step.current_order,
+                            },
+                        ));
+                    }
                 }
             }
         }
@@ -441,7 +477,7 @@ impl Default for PlotConfig {
             stringline: true,
             capacity:   false,
 
-            orientation:  Orientation::VerticalTime,
+            orientation:  Orientation::HorizontalTime,
             time_scale:   1.0,
             time_offset:  Ticks(0),
             order_scale:  1.0,
