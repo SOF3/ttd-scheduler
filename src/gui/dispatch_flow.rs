@@ -2,8 +2,8 @@ use std::mem;
 use std::path::PathBuf;
 
 use egui::{
-    Align2, Color32, FontFamily, FontId, Popup, PopupKind, Pos2, Rect, ScrollArea, Slider, Stroke,
-    TextEdit, Vec2, pos2, vec2,
+    Align2, Color32, FontFamily, FontId, Painter, Popup, PopupKind, Pos2, Rect, ScrollArea, Slider,
+    Stroke, Vec2, pos2, vec2,
 };
 
 use crate::dispatch_flow::{self, DisplayInfo};
@@ -21,7 +21,7 @@ pub struct State {
 
 impl State {
     pub fn ui(&mut self, ui: &mut egui::Ui, (path, order_list): &(PathBuf, Box<OrderList>)) {
-        self.hovered.prev = mem::replace(&mut self.hovered.next, Hovered::default());
+        self.hovered.prev = mem::take(&mut self.hovered.next);
 
         let cache_key = DispatchFlowCacheKey { path: path.clone(), setup: self.setup.clone() };
         let mut force_refresh = false;
@@ -82,10 +82,8 @@ impl State {
             }
         };
         ui.horizontal(|ui| {
-            ui.style_mut().spacing.item_spacing.x = 0.0;
-
             ui.checkbox(&mut self.plot.stringline, "Stringline");
-            ui.checkbox(&mut self.plot.minimap, "Minimap");
+            ui.checkbox(&mut self.plot.capacity, "Capacity chart");
         });
 
         self.plot.ui(ui, order_list, display);
@@ -94,12 +92,12 @@ impl State {
         let plots: Vec<PlotFn> = [
             self.plot.stringline.then(|| {
                 Box::new(|ui: &mut egui::Ui, plot: &mut PlotConfig, hovered: &mut HoveredPair| {
-                    show_stringline(ui, plot, &logger, display, order_list, hovered);
+                    show_stringline(ui, plot, logger, display, order_list, hovered);
                 }) as PlotFn
             }),
-            self.plot.minimap.then(|| {
+            self.plot.capacity.then(|| {
                 Box::new(|ui: &mut egui::Ui, plot: &mut PlotConfig, hovered: &mut HoveredPair| {
-                    show_minimap(ui, plot, display, order_list, hovered);
+                    show_capacity(ui, &self.setup, logger, plot, display, order_list, hovered);
                 }) as PlotFn
             }),
         ]
@@ -132,19 +130,7 @@ fn show_stringline(
     let (resp, painter) = ui.allocate_painter(avbl_size, egui::Sense::click());
     painter.rect_filled(resp.rect, 1.0, Color32::from_rgb(60, 80, 50));
 
-    if let Some(ticks) = hovered.prev.time {
-        painter.line_segment(
-            resolution.full_tick_line(ticks),
-            Stroke::new(1.0, Color32::from_rgb(220, 130, 200)),
-        );
-    }
-
-    if let Some(order) = hovered.prev.order {
-        painter.line_segment(
-            resolution.full_order_line(order as f32),
-            Stroke::new(1.0, Color32::from_rgb(220, 160, 160)),
-        );
-    }
+    draw_hovered_crosshair(&painter, &resolution, &hovered.prev);
 
     let vehicle_step_coord = |time: Ticks| {
         move |v: &VehicleStepLog| {
@@ -219,56 +205,116 @@ fn show_stringline(
         hovered.next.vehicle = Some(nearest);
     }
 
-    if let Some(hover) = resp.hover_pos() {
-        let (time, order) = resolution.pos_to_tick_order(hover);
-        let order = order.floor() as usize;
-
-        hovered.next.time = Some(time);
-        hovered.next.order = Some(order);
-
-        Popup::from_response(&resp)
-            .kind(PopupKind::Tooltip)
-            .sense(egui::Sense::empty())
-            .at_pointer()
-            .width(500.0)
-            .show(|ui| {
-                ui.label(format!(
-                    "Time: {}",
-                    Timestamp::from_ticks(time, display.tpm)
-                        .map_or_else(|_| time.0.to_string(), |t| t.to_string())
-                ));
-                if let Some(order) = order_list.orders.get(order)
-                    && let OrderTyped::GoToStation { ref destination_name, .. }
-                    | OrderTyped::GoToWaypoint { ref destination_name, .. } = order.typed
-                {
-                    ui.label(format!("Order: {destination_name}"));
+    detect_hover(&resp, hovered, &resolution);
+    show_tooltip(
+        &resp,
+        &hovered.prev,
+        order_list,
+        display,
+        nearest_hovered_segment.is_some(),
+        |ui: &mut egui::Ui| {
+            let Some((_, vehicle)) = nearest_hovered_segment else { return };
+            let next = order_list
+                .orders
+                .get(vehicle.next_order)
+                .and_then(|o| o.typed.destination_name())
+                .unwrap_or("Unknown");
+            match vehicle.prev_order {
+                None => {
+                    ui.label(format!("Waiting at {next}"));
                 }
-
-                if let Some((_, vehicle)) = nearest_hovered_segment {
-                    let next = order_list
+                Some((prev, lerp)) => {
+                    let prev = order_list
                         .orders
-                        .get(vehicle.next_order)
+                        .get(prev)
                         .and_then(|o| o.typed.destination_name())
                         .unwrap_or("Unknown");
-                    match vehicle.prev_order {
-                        None => {
-                            ui.label(format!("Waiting at {next}"));
-                        }
-                        Some((prev, lerp)) => {
-                            let prev = order_list
-                                .orders
-                                .get(prev)
-                                .and_then(|o| o.typed.destination_name())
-                                .unwrap_or("Unknown");
-                            ui.label(format!(
-                                "Traveling {:.0}% from {prev} to {next}",
-                                lerp * 100.0
-                            ));
-                        }
-                    }
+                    ui.label(format!("Traveling {:.0}% from {prev} to {next}", lerp * 100.0));
                 }
-            });
+            }
+        },
+    );
+}
+
+fn show_capacity(
+    ui: &mut egui::Ui,
+    _setup: &dispatch_flow::Args,
+    logger: &Logger,
+    plot_config: &PlotConfig,
+    display: &DisplayInfo,
+    order_list: &OrderList,
+    hovered: &mut HoveredPair,
+) {
+    let avbl_size = ui.available_size();
+    let resolution =
+        plot_config.resolution(avbl_size, display, order_list, ui.next_widget_position());
+    let (resp, painter) = ui.allocate_painter(avbl_size, egui::Sense::click());
+    painter.rect_filled(resp.rect, 1.0, Color32::from_rgb(60, 80, 50));
+
+    let max_waiting = logger
+        .steps
+        .iter()
+        .flat_map(|step| &step.orders)
+        .map(|order| order.waiting)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    let mut hovered_waiting = None;
+    for (step, end_time) in logger
+        .steps
+        .iter()
+        .zip(logger.steps.iter().skip(1).map(|s| s.time).chain([display.end_time]))
+    {
+        for (order_index, order) in order_list.orders.iter().enumerate() {
+            if let OrderTyped::GoToStation { .. } = order.typed {
+                let start_coords =
+                    resolution.tick_order_to_pos(step.time, order_index as f32 - 0.5);
+                let end_coords =
+                    resolution.tick_order_to_pos(end_time.max(step.time), order_index as f32 + 0.5);
+                let waiting = step.orders.get(order_index).map(|s| s.waiting).unwrap_or(0);
+                let lerp = waiting as f32 / max_waiting as f32;
+                let color = if lerp < 0.5 {
+                    lerp_rgb(Color32::from_rgb(0, 0, 255), Color32::from_rgb(0, 255, 0), lerp * 2.0)
+                } else {
+                    lerp_rgb(
+                        Color32::from_rgb(0, 255, 0),
+                        Color32::from_rgb(255, 0, 0),
+                        (lerp - 0.5) * 2.0,
+                    )
+                };
+                let rect = Rect::from_two_pos(start_coords, end_coords);
+                painter.rect_filled(rect, 0.0, color);
+                if let Some(hover_pos) = resp.hover_pos()
+                    && rect.contains(hover_pos)
+                {
+                    let max_waiting_in_order = logger
+                        .steps
+                        .iter()
+                        .filter_map(|step| step.orders.get(order_index))
+                        .map(|order| order.waiting)
+                        .sum::<u32>();
+                    hovered_waiting = Some((waiting, max_waiting_in_order));
+                }
+            }
+        }
     }
+
+    draw_hovered_crosshair(&painter, &resolution, &hovered.prev);
+
+    detect_hover(&resp, hovered, &resolution);
+    show_tooltip(
+        &resp,
+        &hovered.prev,
+        order_list,
+        display,
+        hovered_waiting.is_some(),
+        |ui: &mut egui::Ui| {
+            if let Some((waiting, max_waiting_in_order)) = hovered_waiting {
+                ui.label(format!("Waiting: {waiting} / {max_waiting_in_order}"));
+            }
+        },
+    );
 }
 
 #[derive(PartialEq, Eq)]
@@ -291,11 +337,17 @@ struct Logger {
 struct StepLog {
     time:     Ticks,
     vehicles: Vec<VehicleStepLog>,
+    orders:   Vec<OrderStepLog>,
 }
 
 struct VehicleStepLog {
     current_order:   usize,
     lerp_last_order: Option<(usize, f32)>,
+}
+
+#[derive(Clone)]
+struct OrderStepLog {
+    waiting: u32,
 }
 
 struct MissedSlot {
@@ -304,29 +356,40 @@ struct MissedSlot {
 }
 
 impl dispatch_flow::Logger for Logger {
-    fn step(&mut self, _order_list: &OrderList, time: Ticks, state: &dispatch_flow::State) {
-        self.steps.push(StepLog {
-            time,
-            vehicles: state
-                .vehicles
-                .iter()
-                .map(|vehicle| VehicleStepLog {
-                    current_order:   vehicle.current_order,
-                    lerp_last_order: vehicle.last_order.and_then(|(order, start)| {
-                        match vehicle.action {
-                            dispatch_flow::VehicleAction::Traveling { eta } => {
-                                let lerp = (time - start).0 as f32 / (eta - start).0 as f32;
-                                Some((order, lerp))
-                            }
-                            _ => None,
+    fn step(&mut self, order_list: &OrderList, time: Ticks, state: &dispatch_flow::State) {
+        let mut orders = vec![OrderStepLog { waiting: 0 }; order_list.orders.len()];
+        for vehicle in &state.vehicles {
+            let waiting = match vehicle.action {
+                dispatch_flow::VehicleAction::PendingDispatch => true,
+                dispatch_flow::VehicleAction::Traveling { .. } => false,
+                dispatch_flow::VehicleAction::Waiting => true,
+            };
+            if waiting {
+                orders[vehicle.current_order].waiting += 1;
+            }
+        }
+
+        let vehicles = state
+            .vehicles
+            .iter()
+            .map(|vehicle| VehicleStepLog {
+                current_order:   vehicle.current_order,
+                lerp_last_order: vehicle.last_order.and_then(|(order, start)| {
+                    match vehicle.action {
+                        dispatch_flow::VehicleAction::Traveling { eta } => {
+                            let lerp = (time - start).0 as f32 / (eta - start).0 as f32;
+                            Some((order, lerp))
                         }
-                    }),
-                })
-                .collect(),
-        });
+                        _ => None,
+                    }
+                }),
+            })
+            .collect();
+
+        self.steps.push(StepLog { time, vehicles, orders });
     }
 
-    fn missed_dispatch_slot(&mut self, schedule_index: usize, slot: usize, time: Ticks) {
+    fn missed_dispatch_slot(&mut self, schedule_index: usize, _slot: usize, time: Ticks) {
         self.missed_slots.push(MissedSlot { schedule_index, time });
     }
 }
@@ -363,7 +426,7 @@ impl Orientation {
 #[derive(Debug, Clone, Copy)]
 struct PlotConfig {
     stringline: bool,
-    minimap:    bool,
+    capacity:   bool,
 
     orientation:  Orientation,
     time_scale:   f32,
@@ -376,7 +439,7 @@ impl Default for PlotConfig {
     fn default() -> Self {
         Self {
             stringline: true,
-            minimap:    false,
+            capacity:   false,
 
             orientation:  Orientation::VerticalTime,
             time_scale:   1.0,
@@ -543,11 +606,75 @@ fn point_segment_dist_sq(point: Pos2, a: Pos2, b: Pos2) -> f32 {
     (point - projection).length_sq()
 }
 
-fn show_minimap(
-    ui: &mut egui::Ui,
-    plot_config: &PlotConfig,
-    display: &DisplayInfo,
+fn lerp_rgb(a: Color32, b: Color32, t: f32) -> Color32 {
+    let (r, g, b, a) = (
+        a.r() as f32 + (b.r() as f32 - a.r() as f32) * t,
+        a.g() as f32 + (b.g() as f32 - a.g() as f32) * t,
+        a.b() as f32 + (b.b() as f32 - a.b() as f32) * t,
+        a.a() as f32 + (b.a() as f32 - a.a() as f32) * t,
+    );
+    Color32::from_rgba_unmultiplied(r as u8, g as u8, b as u8, a as u8)
+}
+
+fn draw_hovered_crosshair(painter: &Painter, resolution: &Resolution, hovered: &Hovered) {
+    if let Some(ticks) = hovered.time {
+        painter.line_segment(
+            resolution.full_tick_line(ticks),
+            Stroke::new(1.0, Color32::from_rgb(220, 130, 200)),
+        );
+    }
+
+    if let Some(order) = hovered.order {
+        painter.line_segment(
+            resolution.full_order_line(order as f32),
+            Stroke::new(1.0, Color32::from_rgb(220, 160, 160)),
+        );
+    }
+}
+
+fn detect_hover(resp: &egui::Response, hovered: &mut HoveredPair, resolution: &Resolution) {
+    if let Some(hover) = resp.hover_pos() {
+        let (time, order) = resolution.pos_to_tick_order(hover);
+        let order = order.floor() as usize;
+
+        hovered.next.time = Some(time);
+        hovered.next.order = Some(order);
+    }
+}
+
+fn show_tooltip(
+    resp: &egui::Response,
+    hovered: &Hovered,
     order_list: &OrderList,
-    hovered: &mut HoveredPair,
+    display: &DisplayInfo,
+    force_show: bool,
+    additional: impl FnOnce(&mut egui::Ui),
 ) {
+    if !force_show && hovered.time.is_none() && hovered.order.is_none() {
+        return;
+    }
+
+    Popup::from_response(resp)
+        .kind(PopupKind::Tooltip)
+        .sense(egui::Sense::empty())
+        .at_pointer()
+        .show(|ui| {
+            ui.set_min_width(200.0);
+            if let Some(time) = hovered.time {
+                ui.label(format!(
+                    "Time: {}",
+                    Timestamp::from_ticks(time, display.tpm)
+                        .map_or_else(|_| time.0.to_string(), |t| t.to_string())
+                ));
+            }
+            if let Some(order) = hovered.order
+                && let Some(order) = order_list.orders.get(order)
+                && let OrderTyped::GoToStation { ref destination_name, .. }
+                | OrderTyped::GoToWaypoint { ref destination_name, .. } = order.typed
+            {
+                ui.label(format!("Order: {destination_name}"));
+            }
+
+            additional(ui);
+        });
 }

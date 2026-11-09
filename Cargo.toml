@@ -20,4 +20,4 @@ serde_json = "1.0.154"
 [features]
 default = ["gui"]
 gui = ["dep:egui", "dep:rfd", "dep:dirs"]
-show-fps = []
+render-fps = []

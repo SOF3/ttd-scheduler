@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::{self, Display};
 use std::path::Path;
 use std::str::FromStr;
@@ -88,8 +89,11 @@ pub struct Coords {
 #[serde(rename_all = "kebab-case")]
 pub struct Schedule {
     pub duration:            Ticks,
+    #[serde(default)]
     pub max_delay:           Ticks,
     pub relative_start_time: Ticks,
+    #[serde(default)]
+    pub route_ids:           HashMap<String, String>,
     pub slots:               Vec<ScheduleSlot>,
 }
 
@@ -97,13 +101,18 @@ pub struct Schedule {
 #[serde(untagged)]
 pub enum ScheduleSlot {
     OffsetOnly(Ticks),
-    Tagged { offset: Ticks, tags: ArrayVec<Tag, 4> },
+    Composite {
+        offset: Ticks,
+        #[serde(default)]
+        tags:   ArrayVec<Tag, 4>,
+        route:  Option<Route>,
+    },
 }
 
 impl ScheduleSlot {
     pub fn timestamp(&self, schedule: &Schedule) -> Ticks {
         let offset = match *self {
-            ScheduleSlot::OffsetOnly(offset) | ScheduleSlot::Tagged { offset, .. } => offset,
+            ScheduleSlot::OffsetOnly(offset) | ScheduleSlot::Composite { offset, .. } => offset,
         };
         schedule.relative_start_time + offset
     }
@@ -111,7 +120,14 @@ impl ScheduleSlot {
     pub fn has_tag(&self, tag: Tag) -> bool {
         match self {
             ScheduleSlot::OffsetOnly(_) => false,
-            ScheduleSlot::Tagged { tags, .. } => tags.contains(&tag),
+            ScheduleSlot::Composite { tags, .. } => tags.contains(&tag),
+        }
+    }
+
+    pub fn has_route(&self, route: Route) -> bool {
+        match *self {
+            ScheduleSlot::OffsetOnly(_) => false,
+            ScheduleSlot::Composite { route: slot_route, .. } => slot_route == Some(route),
         }
     }
 }
@@ -120,6 +136,7 @@ impl ScheduleSlot {
     Debug,
     Clone,
     Copy,
+    Default,
     PartialEq,
     Eq,
     PartialOrd,
@@ -164,6 +181,9 @@ pub struct JumpToken(pub String);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Tag(pub u8);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Route(pub u8);
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[serde(tag = "condition-variable")]
@@ -174,7 +194,16 @@ pub enum Condition {
         condition_slot_source:       SlotSource,
         condition_dispatch_schedule: usize,
         condition_check_tag:         Option<Tag>,
+        condition_check_route:       Option<Route>,
+        condition_comparator:        TrueOrFalse,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TrueOrFalse {
+    False,
+    True,
 }
 
 #[derive(Serialize, Deserialize)]

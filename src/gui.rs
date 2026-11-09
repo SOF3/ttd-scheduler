@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::Context;
-use egui::{Label, Margin, Rect, TextEdit, vec2};
+use egui::{Label, Margin, TextEdit};
 
 mod dispatch_flow;
 mod platform;
@@ -73,7 +73,6 @@ impl eframe::App for App {
         if cfg!(feature = "render-fps") {
             let fps =
                 self.fps_counter.len() as f64 / (ui.time() - self.fps_counter.front().unwrap());
-            let corner = ui.content_rect().right_top();
             ui.add(Label::new(format!("FPS: {fps}")));
         }
 

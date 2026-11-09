@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result};
 
 use crate::schema::{
     Condition, Duration, JumpToken, OrderList, OrderTyped, Schedule, SlotSource, Ticks, Timestamp,
-    read_order_list,
+    TrueOrFalse, read_order_list,
 };
 
 #[derive(clap::Args)]
@@ -396,8 +396,10 @@ impl Vehicle {
                             ref condition_slot_source,
                             condition_dispatch_schedule,
                             condition_check_tag,
+                            condition_check_route,
+                            condition_comparator,
                         } => {
-                            match *condition_slot_source {
+                            let matched = match *condition_slot_source {
                                 SlotSource::Vehicle => {
                                     let mut matched = false;
                                     let schedule_slot = self
@@ -416,16 +418,22 @@ impl Vehicle {
                                         {
                                             matched = true;
                                         }
+                                        if let Some(route) = condition_check_route
+                                            && slot.has_route(route)
+                                        {
+                                            matched = true;
+                                        }
                                         // TODO other schdule condition
                                     }
                                     matched
                                 }
-                            }
+                            };
+                            matched == (condition_comparator == TrueOrFalse::True)
                         }
                     };
                     if matched {
                         self.current_order =
-                            *ctx.jump_index.get(&jump_to).context("invalid jump target")?;
+                            *ctx.jump_index.get(jump_to).context("invalid jump target")?;
                         override_travel_time.get_or_insert(jump_taken_travel_time);
                     } else {
                         self.current_order += 1;
@@ -460,7 +468,7 @@ impl Logger for StatsLogger {
         snapshot.orders.resize_with(order_list.orders.len(), Default::default);
         for vehicle in &state.vehicles {
             match vehicle.action {
-                VehicleAction::PendingDispatch { .. } | VehicleAction::Waiting { .. } => {
+                VehicleAction::PendingDispatch | VehicleAction::Waiting => {
                     snapshot.orders[vehicle.current_order].waiting += 1;
                 }
                 VehicleAction::Traveling { .. } => {
