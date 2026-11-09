@@ -133,8 +133,6 @@ impl Args {
                 .filter_map(|(i, order)| order.jump_from.clone().map(|token| (token, i)))
                 .collect(),
             start_time,
-            day_length,
-            tpm,
         };
         let mut state = State {
             scheduler_heap: BinaryHeap::new(),
@@ -215,8 +213,6 @@ struct Context<'a> {
     order_list: &'a OrderList,
     jump_index: HashMap<JumpToken, usize>,
     start_time: Ticks,
-    day_length: Ticks,
-    tpm:        Ticks,
 }
 
 pub struct State {
@@ -330,7 +326,8 @@ impl ScheduleState {
             if self.next_dispatch_slot >= num_slots {
                 self.next_dispatch_slot = 0;
             }
-            let slot_data = &schedule.slots[self.next_dispatch_slot];
+
+            let slot_data = &schedule.slots[slot];
             let mut dispatch_time = slot_data.timestamp(schedule) + self.dispatch_slot_cycles;
             if let Some(last) = self.last_dispatch_time
                 && dispatch_time <= last

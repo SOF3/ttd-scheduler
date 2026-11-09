@@ -68,6 +68,14 @@ impl OrderTyped {
         }
     }
 
+    pub fn destination_id(&self) -> Option<u32> {
+        match *self {
+            OrderTyped::GoToStation { destination_id, .. }
+            | OrderTyped::GoToWaypoint { destination_id, .. } => Some(destination_id),
+            OrderTyped::Conditional { .. } => None,
+        }
+    }
+
     pub fn destination_location(&self) -> Option<Coords> {
         match *self {
             OrderTyped::GoToStation { destination_location, .. }

@@ -11,8 +11,10 @@ derive_more = { version = "2.1.1", features = ["add", "add_assign"] }
 dirs = { version = "7.0.0", optional = true }
 eframe = "0.37.0"
 egui = { version = "0.37.0", optional = true }
+either = "1.19.0"
 itertools = "0.15.0"
 num-traits = "0.2.19"
+ordered-float = "5.5.1"
 rfd = { version = "0.18.0", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

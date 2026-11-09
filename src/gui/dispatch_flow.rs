@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::mem;
 use std::path::PathBuf;
 
@@ -6,6 +7,8 @@ use egui::{
     Align2, Color32, FontFamily, FontId, Painter, Popup, PopupKind, Pos2, Rect, ScrollArea, Slider,
     Stroke, Vec2, pos2, vec2,
 };
+use either::Either;
+use ordered_float::OrderedFloat;
 
 use crate::dispatch_flow::{self, DisplayInfo};
 use crate::gui::number_edit;
@@ -27,7 +30,6 @@ impl State {
         self.hovered.prev = mem::take(&mut self.hovered.next);
 
         let cache_key = DispatchFlowCacheKey { path: path.clone(), setup: self.setup.clone() };
-        let mut force_refresh = false;
         ui.horizontal(|ui| {
             ui.label("Starting vehicles:");
             self.initial_texts.resize(order_list.schedules.len(), String::from("0"));
@@ -58,10 +60,9 @@ impl State {
                     });
                 }
             });
-            force_refresh = ui.button("Refresh").clicked();
         });
         let result = match &self.result {
-            Some(result) if force_refresh || result.cache_key != cache_key => None,
+            Some(result) if result.cache_key != cache_key => None,
             None => None,
             Some(result) => Some(result),
         };
@@ -137,21 +138,11 @@ fn show_stringline(
     draw_hovered_crosshair(&painter, &resolution, &hovered.prev);
 
     let vehicle_step_coord = |time: Ticks| {
+        let resolution = &resolution;
         move |v: &VehicleStepLog| {
             let order = match v.lerp_last_order {
-                Some((prev, lerp)) => {
-                    let cycle = resolution.num_orders as f32;
-                    let change = v.current_order as f32 - prev as f32;
-                    let change = if change > cycle * ORDER_WRAP_THRESHOLD {
-                        change - cycle
-                    } else if change < -cycle * ORDER_WRAP_THRESHOLD {
-                        change + cycle
-                    } else {
-                        change
-                    };
-                    (prev as f32 + lerp * change + 0.5).rem_euclid(cycle) - 0.5
-                }
-                None => v.current_order as f32,
+                Some((prev, lerp)) => Order::Lerp(prev, v.current_order, lerp),
+                None => Order::Exact(v.current_order),
             };
             resolution.tick_order_to_pos(time, order)
         }
@@ -165,7 +156,7 @@ fn show_stringline(
         else {
             continue;
         };
-        let pos = resolution.tick_order_to_pos(slot.time, order as f32);
+        let pos = resolution.tick_order_to_pos(slot.time, Order::Exact(order));
         painter.text(
             pos,
             Align2::CENTER_CENTER,
@@ -247,6 +238,7 @@ fn show_stringline(
         &hovered.prev,
         order_list,
         display,
+        &resolution,
         nearest_hovered_segment.is_some(),
         |ui: &mut egui::Ui| {
             let Some((_, vehicle)) = nearest_hovered_segment else { return };
@@ -285,6 +277,7 @@ fn show_capacity(
     let resolution =
         plot_config.resolution(avbl_size, display, order_list, ui.next_widget_position());
     let (resp, painter) = ui.allocate_painter(avbl_size, egui::Sense::click());
+    let painter = painter.with_clip_rect(resp.rect.intersect(painter.clip_rect()));
     painter.rect_filled(resp.rect, 1.0, Color32::from_rgb(60, 80, 50));
 
     let max_waiting = logger
@@ -305,9 +298,9 @@ fn show_capacity(
         for (order_index, order) in order_list.orders.iter().enumerate() {
             if let OrderTyped::GoToStation { .. } = order.typed {
                 let start_coords =
-                    resolution.tick_order_to_pos(step.time, order_index as f32 - 0.5);
-                let end_coords =
-                    resolution.tick_order_to_pos(end_time.max(step.time), order_index as f32 + 0.5);
+                    resolution.tick_order_to_pos(step.time, Order::StartBound(order_index));
+                let end_coords = resolution
+                    .tick_order_to_pos(end_time.max(step.time), Order::EndBound(order_index));
                 let waiting = step.orders.get(order_index).map(|s| s.waiting).unwrap_or(0);
                 let lerp = waiting as f32 / max_waiting as f32;
                 let color = if lerp < 0.5 {
@@ -320,17 +313,38 @@ fn show_capacity(
                     )
                 };
                 let rect = Rect::from_two_pos(start_coords, end_coords);
-                painter.rect_filled(rect, 0.0, color);
-                if let Some(hover_pos) = resp.hover_pos()
-                    && rect.contains(hover_pos)
-                {
-                    let max_waiting_in_order = logger
-                        .steps
-                        .iter()
-                        .filter_map(|step| step.orders.get(order_index))
-                        .map(|order| order.waiting)
-                        .sum::<u32>();
-                    hovered_waiting = Some((waiting, max_waiting_in_order));
+                let cycle = resolution.num_orders as f32 * resolution.px_per_order;
+                let offset = plot_config.orientation.vector(0.0, cycle);
+                for rect in [rect, rect.translate(-offset)] {
+                    painter.rect_filled(rect, 0.0, color);
+                    if let Some(hover_pos) = resp.hover_pos()
+                        && rect.intersect(resp.rect).contains(hover_pos)
+                    {
+                        let max_waiting_in_order = logger
+                            .steps
+                            .iter()
+                            .flat_map(|step| {
+                                if plot_config.group_by_dest {
+                                    Either::Left(
+                                        order_list
+                                            .orders
+                                            .iter()
+                                            .enumerate()
+                                            .filter(|(_, o)| {
+                                                o.typed.destination_id()
+                                                    == order.typed.destination_id()
+                                            })
+                                            .filter_map(|(index, _)| step.orders.get(index)),
+                                    )
+                                } else {
+                                    Either::Right(step.orders.get(order_index).into_iter())
+                                }
+                            })
+                            .map(|order| order.waiting)
+                            .max()
+                            .unwrap_or(0);
+                        hovered_waiting = Some((waiting, max_waiting_in_order));
+                    }
                 }
             }
         }
@@ -344,6 +358,7 @@ fn show_capacity(
         &hovered.prev,
         order_list,
         display,
+        &resolution,
         hovered_waiting.is_some(),
         |ui: &mut egui::Ui| {
             if let Some((waiting, max_waiting_in_order)) = hovered_waiting {
@@ -464,11 +479,12 @@ struct PlotConfig {
     stringline: bool,
     capacity:   bool,
 
-    orientation:  Orientation,
-    time_scale:   f32,
-    time_offset:  Ticks,
-    order_scale:  f32,
-    order_offset: f32,
+    orientation:   Orientation,
+    time_scale:    f32,
+    time_offset:   Ticks,
+    order_scale:   f32,
+    order_offset:  f32,
+    group_by_dest: bool,
 }
 
 impl Default for PlotConfig {
@@ -477,11 +493,12 @@ impl Default for PlotConfig {
             stringline: true,
             capacity:   false,
 
-            orientation:  Orientation::HorizontalTime,
-            time_scale:   1.0,
-            time_offset:  Ticks(0),
-            order_scale:  1.0,
-            order_offset: 0.0,
+            orientation:   Orientation::HorizontalTime,
+            time_scale:    1.0,
+            time_offset:   Ticks(0),
+            order_scale:   1.0,
+            order_offset:  0.0,
+            group_by_dest: false,
         }
     }
 }
@@ -523,9 +540,12 @@ impl PlotConfig {
                 ui.add(Slider::new(&mut self.order_scale, 1.0..=10.0).suffix("x"));
 
                 ui.label("Order offset");
-                let hidden_length =
-                    order_list.orders.len() as f32 * (1.0 - self.order_scale.recip());
-                ui.add(Slider::new(&mut self.order_offset, 0.0..=hidden_length).suffix(""));
+                ui.add(
+                    Slider::new(&mut self.order_offset, 0.0..=order_list.orders.len() as f32)
+                        .suffix(""),
+                );
+
+                ui.checkbox(&mut self.group_by_dest, "Group by station");
             });
         });
     }
@@ -542,6 +562,32 @@ impl PlotConfig {
             / ((display.end_time - display.start_time).0 as f32);
         let px_per_order =
             self.orientation.order(avbl_size) / (num_orders as f32) * self.order_scale;
+
+        let mut order_mapping = vec![0.0; num_orders];
+        if self.group_by_dest {
+            let mut map = HashMap::new();
+            let mut counter = 0;
+            for (order_index, order) in order_list.orders.iter().enumerate() {
+                if let Some(dest) = order.typed.destination_id() {
+                    order_mapping[order_index] = *map.entry(dest).or_insert_with(|| {
+                        let index = counter as f32;
+                        counter += 1;
+                        index
+                    })
+                }
+            }
+        } else {
+            let mut counter = 0;
+            for (order_index, order) in order_list.orders.iter().enumerate() {
+                if let OrderTyped::GoToStation { .. } | OrderTyped::GoToWaypoint { .. } =
+                    order.typed
+                {
+                    order_mapping[order_index] = counter as f32;
+                    counter += 1;
+                }
+            }
+        }
+
         Resolution {
             px_per_tick,
             px_per_order,
@@ -549,18 +595,20 @@ impl PlotConfig {
             time_range: [display.start_time, display.end_time],
             num_orders: order_list.orders.len(),
             rect: Rect::from_min_size(rect_min, avbl_size),
+            order_mapping,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct Resolution {
-    px_per_tick:  f32,
-    px_per_order: f32,
-    config:       PlotConfig,
-    time_range:   [Ticks; 2],
-    num_orders:   usize,
-    rect:         Rect,
+    px_per_tick:   f32,
+    px_per_order:  f32,
+    config:        PlotConfig,
+    time_range:    [Ticks; 2],
+    num_orders:    usize,
+    rect:          Rect,
+    order_mapping: Vec<f32>,
 }
 
 impl Resolution {
@@ -570,26 +618,61 @@ impl Resolution {
         self.config.orientation.time(self.rect.min.to_vec2()) + tick_px
     }
 
-    fn order_to_pos(&self, order: f32) -> f32 {
-        let order_px = (order + 0.5 - self.config.order_offset) * self.px_per_order;
-        self.config.orientation.order(self.rect.min.to_vec2()) + order_px
+    fn order_to_pos(&self, order: Order) -> f32 {
+        let resolve_order = |order: usize| self.order_mapping.get(order).copied().unwrap_or(0.0);
+
+        let cycle = self.num_orders as f32;
+        let offset = match order {
+            Order::Exact(order) => {
+                (resolve_order(order) + 0.5 - self.config.order_offset).rem_euclid(cycle)
+            }
+            Order::Lerp(prev, next, lerp) => {
+                let prev = resolve_order(prev) + 0.5;
+                let next = resolve_order(next) + 0.5;
+                let change = next - prev;
+                let change = if change > cycle * ORDER_WRAP_THRESHOLD {
+                    change - cycle
+                } else if change < -cycle * ORDER_WRAP_THRESHOLD {
+                    change + cycle
+                } else {
+                    change
+                };
+                (prev + lerp * change - self.config.order_offset).rem_euclid(cycle)
+            }
+            Order::StartBound(order) => {
+                (resolve_order(order) - self.config.order_offset).rem_euclid(cycle)
+            }
+            Order::EndBound(order) => {
+                (resolve_order(order) - self.config.order_offset).rem_euclid(cycle) + 1.0
+            }
+        };
+
+        self.config.orientation.order(self.rect.min.to_vec2()) + offset * self.px_per_order
     }
 
-    fn tick_order_to_pos(&self, tick: Ticks, order: f32) -> Pos2 {
+    fn tick_order_to_pos(&self, tick: Ticks, order: Order) -> Pos2 {
         match self.config.orientation {
             Orientation::HorizontalTime => pos2(self.tick_to_pos(tick), self.order_to_pos(order)),
             Orientation::VerticalTime => pos2(self.order_to_pos(order), self.tick_to_pos(tick)),
         }
     }
 
-    fn pos_to_tick_order(&self, pos: Pos2) -> (Ticks, f32) {
+    fn pos_to_tick_order(&self, pos: Pos2) -> (Ticks, usize) {
         let vec = pos - self.rect.min;
         let tick_px = self.config.orientation.time(vec);
         let order_px = self.config.orientation.order(vec);
         let tick = Ticks((tick_px / self.px_per_tick) as i32)
             + self.time_range[0]
             + self.config.time_offset;
-        let order = order_px / self.px_per_order + self.config.order_offset;
+        let order_offset = order_px / self.px_per_order + self.config.order_offset;
+        let order_offset = order_offset.rem_euclid(self.num_orders as f32);
+        let order = self
+            .order_mapping
+            .iter()
+            .copied()
+            .enumerate()
+            .min_by_key(|&(_, mapped)| OrderedFloat((order_offset - mapped).abs()))
+            .map_or(0, |(index, _)| index);
         (tick, order)
     }
 
@@ -601,13 +684,20 @@ impl Resolution {
         }
     }
 
-    fn full_order_line(&self, order: f32) -> [Pos2; 2] {
+    fn full_order_line(&self, order: Order) -> [Pos2; 2] {
         let v = self.order_to_pos(order);
         match self.config.orientation {
             Orientation::HorizontalTime => [pos2(self.rect.min.x, v), pos2(self.rect.max.x, v)],
             Orientation::VerticalTime => [pos2(v, self.rect.min.y), pos2(v, self.rect.max.y)],
         }
     }
+}
+
+enum Order {
+    Exact(usize),
+    Lerp(usize, usize, f32),
+    StartBound(usize),
+    EndBound(usize),
 }
 
 #[derive(Debug, Default)]
@@ -662,7 +752,7 @@ fn draw_hovered_crosshair(painter: &Painter, resolution: &Resolution, hovered: &
 
     if let Some(order) = hovered.order {
         painter.line_segment(
-            resolution.full_order_line(order as f32),
+            resolution.full_order_line(Order::Exact(order)),
             Stroke::new(1.0, Color32::from_rgb(220, 160, 160)),
         );
     }
@@ -671,7 +761,6 @@ fn draw_hovered_crosshair(painter: &Painter, resolution: &Resolution, hovered: &
 fn detect_hover(resp: &egui::Response, hovered: &mut HoveredPair, resolution: &Resolution) {
     if let Some(hover) = resp.hover_pos() {
         let (time, order) = resolution.pos_to_tick_order(hover);
-        let order = order.floor() as usize;
 
         hovered.next.time = Some(time);
         hovered.next.order = Some(order);
@@ -683,6 +772,7 @@ fn show_tooltip(
     hovered: &Hovered,
     order_list: &OrderList,
     display: &DisplayInfo,
+    resolution: &Resolution,
     force_show: bool,
     additional: impl FnOnce(&mut egui::Ui),
 ) {
@@ -690,10 +780,18 @@ fn show_tooltip(
         return;
     }
 
+    let pos = if let Some(time) = hovered.time
+        && let Some(order) = hovered.order
+    {
+        resolution.tick_order_to_pos(time, Order::Exact(order))
+    } else {
+        resolution.rect.center()
+    };
+
     Popup::from_response(resp)
         .kind(PopupKind::Tooltip)
         .sense(egui::Sense::empty())
-        .at_pointer()
+        .at_position(pos)
         .show(|ui| {
             ui.set_min_width(200.0);
             if let Some(time) = hovered.time {
