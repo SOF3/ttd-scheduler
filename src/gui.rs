@@ -26,10 +26,11 @@ impl Command {
             fps_counter: VecDeque::new(),
         };
         if let Some(file) = &self.file {
-            app.states.file = Some((
-                file.clone(),
-                Box::new(read_order_list(file).context("read order list file")?),
-            ));
+            app.states.file = Some(LoadedFile {
+                path:       file.clone(),
+                order_list: Box::new(read_order_list(file).context("read order list file")?),
+                generation: 0,
+            });
         }
         eframe::run_native(
             "OpenTTD scheduler",
@@ -49,7 +50,7 @@ struct App {
 
 #[derive(Default)]
 struct States {
-    file:          Option<(PathBuf, Box<OrderList>)>,
+    file:          Option<LoadedFile>,
     file_err:      String,
     tab:           WhichTab,
     dispatch_flow: dispatch_flow::State,
@@ -102,11 +103,11 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn choose_file(&mut self, ui: &mut egui::Ui) {
+    fn choose_file(&mut self, ui: &mut egui::Ui) -> bool {
         let choose_file = ui.horizontal(|ui| {
             let resp = ui.button("Choose file");
-            if let Some((file, _)) = &self.states.file {
-                ui.label(file.display().to_string());
+            if let Some(loaded) = &self.states.file {
+                ui.label(loaded.path.display().to_string());
             }
             if !self.states.file_err.is_empty() {
                 ui.colored_label(egui::Color32::RED, &self.states.file_err);
@@ -118,9 +119,17 @@ impl App {
                 &mut self.states.file,
                 &mut self.states.file_err,
                 choose_file.inner,
-            );
+            )
+        } else {
+            false
         }
     }
+}
+
+struct LoadedFile {
+    path:       PathBuf,
+    order_list: Box<OrderList>,
+    generation: usize,
 }
 
 fn number_edit<N>(
