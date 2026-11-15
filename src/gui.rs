@@ -1,37 +1,46 @@
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt::Display;
+use std::num::Wrapping;
 use std::ops::{AddAssign, SubAssign};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, atomic};
 
 use anyhow::Context;
-use egui::{Label, Margin, TextEdit};
+use egui::{CursorIcon, Label, Margin, TextEdit};
 
-mod dispatch_flow;
+mod charts;
 mod platform;
 use platform::Platform;
 
-use crate::schema::{OrderList, read_order_list};
+use crate::schema::{OrderList, read_order_list_from_path};
 
 #[derive(clap::Args)]
 pub struct Command {
-    pub file: Option<PathBuf>,
+    pub files: Vec<PathBuf>,
 }
 
 impl Command {
     pub fn run(&self) -> anyhow::Result<()> {
         let mut app = App {
-            platform:    Box::new(platform::Native),
+            platform:    Box::new(platform::Native::default()),
             states:      States::default(),
             fps_counter: VecDeque::new(),
         };
-        if let Some(file) = &self.file {
-            app.states.file = Some(LoadedFile {
+        for file in &self.files {
+            app.states.files.files.push(LoadedFile {
                 path:       file.clone(),
-                order_list: Box::new(read_order_list(file).context("read order list file")?),
-                generation: 0,
+                order_list: Box::new(
+                    read_order_list_from_path(file).context("read order list file")?,
+                ),
+                file_id:    FileId(
+                    app.states.files.next_file_id.fetch_add(1, atomic::Ordering::Relaxed),
+                ),
             });
         }
+
         eframe::run_native(
             "OpenTTD scheduler",
             eframe::NativeOptions::default(),
@@ -50,16 +59,16 @@ struct App {
 
 #[derive(Default)]
 struct States {
-    file:          Option<LoadedFile>,
-    file_err:      String,
-    tab:           WhichTab,
-    dispatch_flow: dispatch_flow::State,
+    files:  FileList,
+    charts: charts::State,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum WhichTab {
-    #[default]
-    DispatchFlow,
+#[derive(Default)]
+struct FileList {
+    files:        Vec<LoadedFile>,
+    last_err:     String,
+    generation:   Wrapping<u8>,
+    next_file_id: Arc<AtomicUsize>,
 }
 
 impl eframe::App for App {
@@ -78,59 +87,61 @@ impl eframe::App for App {
         }
 
         egui::Frame::new().outer_margin(Margin::same(10)).show(ui, |ui| {
-            self.choose_file(ui);
+            self.choose_files(ui);
 
-            ui.horizontal(|ui| {
-                ui.style_mut().spacing.item_spacing.x = 0.0;
-
-                ui.selectable_value(
-                    &mut self.states.tab,
-                    WhichTab::DispatchFlow,
-                    "Dispatch simulator",
-                );
-            });
-            ui.separator();
-
-            match self.states.tab {
-                WhichTab::DispatchFlow => {
-                    if let Some(file) = &self.states.file {
-                        self.states.dispatch_flow.ui(ui, file)
-                    }
-                }
-            }
+            self.states.charts.ui(ui, &self.states.files);
         });
     }
 }
 
 impl App {
-    fn choose_file(&mut self, ui: &mut egui::Ui) -> bool {
-        let choose_file = ui.horizontal(|ui| {
-            let resp = ui.button("Choose file");
-            if let Some(loaded) = &self.states.file {
-                ui.label(loaded.path.display().to_string());
+    fn choose_files(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let mut removals = Vec::new();
+            for (i, file) in self.states.files.files.iter().enumerate() {
+                if ui
+                    .colored_label(egui::Color32::RED, "X")
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    removals.push(i);
+                }
+                ui.label(file.filename());
             }
-            if !self.states.file_err.is_empty() {
-                ui.colored_label(egui::Color32::RED, &self.states.file_err);
+
+            if !removals.is_empty() {
+                let mut i = 0;
+                self.states.files.files.retain(|_| {
+                    let remove = removals.contains(&i);
+                    i += 1;
+                    !remove
+                });
+                self.states.files.generation += 1;
             }
-            resp.clicked()
+
+            let resp = ui.button("Add file");
+            if !self.states.files.last_err.is_empty() {
+                ui.colored_label(egui::Color32::RED, &self.states.files.last_err);
+            }
+            self.platform.choose_order_list_file(&resp.ctx, &mut self.states.files, resp.clicked());
         });
-        if choose_file.inner {
-            self.platform.choose_order_list_file(
-                &mut self.states.file,
-                &mut self.states.file_err,
-                choose_file.inner,
-            )
-        } else {
-            false
-        }
     }
 }
 
 struct LoadedFile {
     path:       PathBuf,
     order_list: Box<OrderList>,
-    generation: usize,
+    file_id:    FileId,
 }
+
+impl LoadedFile {
+    fn filename(&self) -> Cow<'_, str> {
+        self.path.file_name().expect("regular file must have a name").to_string_lossy()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileId(usize);
 
 fn number_edit<N>(
     ui: &mut egui::Ui,

@@ -1,49 +1,77 @@
 use std::path::PathBuf;
+use std::sync::atomic;
 
-use crate::gui::LoadedFile;
-use crate::schema::read_order_list;
+use anyhow::Context;
+use futures::executor::block_on;
+use futures::{StreamExt, stream};
 
-pub struct Native;
+use crate::gui::{FileId, FileList, LoadedFile};
+use crate::schema::read_order_list_from_str;
+
+#[derive(Default)]
+pub struct Native {
+    executor:  smol::LocalExecutor<'static>,
+    load_task: Option<smol::Task<Vec<anyhow::Result<LoadedFile>>>>,
+}
 
 impl super::Platform for Native {
-    fn choose_order_list_file(
-        &mut self,
-        out: &mut Option<LoadedFile>,
-        out_err: &mut String,
-        open: bool,
-    ) -> bool {
-        if !open {
-            return false;
+    fn choose_order_list_file(&mut self, ctx: &egui::Context, files: &mut FileList, open: bool) {
+        if open {
+            let ctx = ctx.clone();
+            let next_file_id = files.next_file_id.clone();
+
+            let mut dialog = rfd::AsyncFileDialog::new().add_filter("orderlist", &["json"]);
+            if let Some(dir) = files
+                .files
+                .last()
+                .and_then(|last| last.path.parent().map(PathBuf::from))
+                .or_else(openttd_order_lists_dir)
+            {
+                dialog = dialog.set_directory(dir);
+            }
+
+            let task = self.executor.spawn(async move {
+                let files = dialog.pick_files().await;
+                let results: Vec<anyhow::Result<_>> = stream::iter(files.into_iter().flatten())
+                    .then(async |file| {
+                        let contents = file.read().await;
+                        let contents =
+                            String::from_utf8(contents).context("file contains invalid utf-8")?;
+                        Ok(LoadedFile {
+                            path:       file.path().to_path_buf(),
+                            order_list: Box::new(read_order_list_from_str(&contents)?),
+                            file_id:    FileId(
+                                next_file_id.fetch_add(1, atomic::Ordering::Relaxed),
+                            ),
+                        })
+                    })
+                    .collect()
+                    .await;
+                ctx.request_repaint();
+                results
+            });
+            self.load_task = Some(task);
         }
 
-        let mut dialog = rfd::FileDialog::new().add_filter("json", &["json"]);
-        if let Some(current) = &*out
-            && let Some(parent) = current.path.parent()
-        {
-            dialog = dialog.set_directory(parent);
-        } else if let Some(dir) = openttd_order_lists_dir() {
-            dialog = dialog.set_directory(dir);
-        }
-        if let Some(file) = dialog.pick_file() {
-            use std::fmt::Write;
-            match read_order_list(&file) {
-                Ok(order_list) => {
-                    let generation =
-                        out.as_ref().map(|loaded| loaded.generation + 1).unwrap_or_default();
-                    *out = Some(LoadedFile {
-                        path: file,
-                        order_list: Box::new(order_list),
-                        generation,
-                    });
-                    out_err.clear();
-                }
-                Err(err) => {
-                    write!(out_err, "{err:?}").unwrap();
+        let results = if let Some(task) = self.load_task.take() {
+            self.executor.try_tick();
+            if task.is_finished() {
+                Some(block_on(task))
+            } else {
+                self.load_task = Some(task);
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(results) = results {
+            for result in results {
+                match result {
+                    Ok(file) => files.files.push(file),
+                    Err(err) => files.last_err = format!("{err:?}"),
                 }
             }
-            true
-        } else {
-            false
+            files.generation += 1;
         }
     }
 }

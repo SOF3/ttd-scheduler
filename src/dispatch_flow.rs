@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result};
 
 use crate::schema::{
     Condition, Duration, JumpToken, OrderList, OrderTyped, Schedule, SlotSource, Ticks, Timestamp,
-    TrueOrFalse, read_order_list,
+    TrueOrFalse, read_order_list_from_path,
 };
 
 #[derive(clap::Args)]
@@ -71,7 +71,7 @@ impl FromStr for InitialVehicles {
 impl Command {
     pub fn run(&self) -> Result<()> {
         let mut logger = StatsLogger::default();
-        let order_list = read_order_list(&self.order_list)?;
+        let order_list = read_order_list_from_path(&self.order_list)?;
         let display = self.args.simulate(&order_list, &mut logger)?;
 
         for snapshot in logger.snapshots {
@@ -196,7 +196,7 @@ impl Args {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DisplayInfo {
     pub tpm:        Ticks,
     pub start_time: Ticks,

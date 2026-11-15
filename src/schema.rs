@@ -17,6 +17,15 @@ pub struct OrderList {
     pub game_properties: GameProperties,
 }
 
+impl OrderList {
+    pub fn find_schedule_order(&self, schedule_index: usize) -> Option<(usize, &Order)> {
+        self.orders
+            .iter()
+            .enumerate()
+            .find(|(_, order)| order.schedule_index == Some(schedule_index))
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "type")]
 pub struct GameProperties {
@@ -37,7 +46,7 @@ pub struct Order {
 pub enum OrderTyped {
     #[serde(rename_all = "kebab-case")]
     GoToStation {
-        destination_id:       u32,
+        destination_id:       DestinationId,
         destination_name:     String,
         destination_location: Coords,
         travel_time:          Ticks,
@@ -45,7 +54,7 @@ pub enum OrderTyped {
     },
     #[serde(rename_all = "kebab-case")]
     GoToWaypoint {
-        destination_id:       u32,
+        destination_id:       DestinationId,
         destination_name:     String,
         destination_location: Coords,
         travel_time:          Ticks,
@@ -68,7 +77,7 @@ impl OrderTyped {
         }
     }
 
-    pub fn destination_id(&self) -> Option<u32> {
+    pub fn destination_id(&self) -> Option<DestinationId> {
         match *self {
             OrderTyped::GoToStation { destination_id, .. }
             | OrderTyped::GoToWaypoint { destination_id, .. } => Some(destination_id),
@@ -85,6 +94,9 @@ impl OrderTyped {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DestinationId(pub u32);
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Coords {
     #[serde(rename = "X")]
@@ -99,6 +111,7 @@ pub struct Schedule {
     pub duration:            Ticks,
     #[serde(default)]
     pub max_delay:           Ticks,
+    #[serde(default)]
     pub relative_start_time: Ticks,
     #[serde(default)]
     pub route_ids:           HashMap<String, String>,
@@ -220,12 +233,18 @@ pub enum SlotSource {
     Vehicle,
 }
 
-pub fn read_order_list(path: &Path) -> anyhow::Result<OrderList> {
-    try_read_order_list(path).with_context(|| format!("read order list at {}", path.display()))
+pub fn read_order_list_from_path(path: &Path) -> anyhow::Result<OrderList> {
+    try_read_order_list_from_path(path)
+        .with_context(|| format!("read order list at {}", path.display()))
 }
-fn try_read_order_list(path: &Path) -> anyhow::Result<OrderList> {
+
+fn try_read_order_list_from_path(path: &Path) -> anyhow::Result<OrderList> {
     let contents = fs::read_to_string(path).context("open config")?;
-    serde_json::from_str(&contents).context("parse config")
+    read_order_list_from_str(&contents)
+}
+
+pub fn read_order_list_from_str(contents: &str) -> anyhow::Result<OrderList> {
+    serde_json::from_str(contents).context("parse config")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
