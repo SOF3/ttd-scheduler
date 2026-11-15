@@ -247,7 +247,7 @@ pub fn read_order_list_from_str(contents: &str) -> anyhow::Result<OrderList> {
     serde_json::from_str(contents).context("parse config")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Timestamp {
     pub hours:   u8,
     pub minutes: u8,
@@ -287,7 +287,7 @@ impl Timestamp {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Duration {
     pub hours:   u8,
     pub minutes: u8,

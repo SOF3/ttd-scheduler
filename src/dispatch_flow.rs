@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Context as _, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::schema::{
     Condition, Duration, JumpToken, OrderList, OrderTyped, Schedule, SlotSource, Ticks, Timestamp,
@@ -19,7 +20,7 @@ pub struct Command {
     pub args: Args,
 }
 
-#[derive(clap::Args, Clone, PartialEq, Eq)]
+#[derive(clap::Args, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Args {
     /// Use this as the starting time.
     #[clap(long, value_name = "HH:MM", value_parser)]
@@ -47,7 +48,7 @@ impl Default for Args {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitialVehicles(pub Vec<u32>);
 
 impl FromStr for InitialVehicles {

@@ -1,3 +1,5 @@
+use std::fs;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::atomic;
 
@@ -5,7 +7,7 @@ use anyhow::Context;
 use futures::executor::block_on;
 use futures::{StreamExt, stream};
 
-use crate::gui::{FileId, FileList, LoadedFile};
+use crate::gui::{FileId, FileList, LoadedFile, PersistData};
 use crate::schema::read_order_list_from_str;
 
 #[derive(Default)]
@@ -74,6 +76,31 @@ impl super::Platform for Native {
             files.generation += 1;
         }
     }
+
+    fn read_persist_data(&self) -> anyhow::Result<PersistData> {
+        let path = persist_path()?;
+        let contents = match fs::read(&path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(PersistData::default()),
+            Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+        };
+        serde_json::from_slice(&contents).with_context(|| format!("parse {}", path.display()))
+    }
+
+    fn write_persist_data(&self, data: &PersistData) -> anyhow::Result<()> {
+        let path = persist_path()?;
+        let dir = path.parent().context("persist file has no parent directory")?;
+        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let contents = serde_json::to_vec(data).context("serialize persist data")?;
+        fs::write(&path, contents).with_context(|| format!("write {}", path.display()))
+    }
+}
+
+fn persist_path() -> anyhow::Result<PathBuf> {
+    let mut path = dirs::data_dir().context("could not find the user data directory")?;
+    path.push("ttd-scheduler");
+    path.push("persist.json");
+    Ok(path)
 }
 
 fn openttd_order_lists_dir() -> Option<PathBuf> {

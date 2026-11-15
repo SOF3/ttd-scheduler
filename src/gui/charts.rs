@@ -14,7 +14,7 @@ use indexmap::IndexSet;
 use ordered_float::OrderedFloat;
 
 use crate::dispatch_flow::{self, DisplayInfo};
-use crate::gui::{FileId, FileList, number_edit};
+use crate::gui::{FileId, FileList, Persist, number_edit};
 use crate::schema::{self, DestinationId, Duration, OrderList, OrderTyped, Ticks, Timestamp};
 
 const ORDER_WRAP_THRESHOLD: f32 = 0.7;
@@ -30,7 +30,7 @@ pub struct State {
 }
 
 impl State {
-    pub fn ui(&mut self, ui: &mut egui::Ui, loaded: &FileList) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, loaded: &FileList, persist: &mut Persist) {
         if loaded.files.is_empty() {
             return;
         }
@@ -39,7 +39,13 @@ impl State {
 
         for file in &loaded.files {
             if !self.setups.contains_key(&file.file_id) {
-                let setup = self.prev_setups.get(&file.path).and_then(|id| self.setups.get(id)).cloned().unwrap_or_default();
+                let setup = self
+                    .prev_setups
+                    .get(&file.path)
+                    .and_then(|id| self.setups.get(id))
+                    .or_else(|| persist.data.chart_setups.get(&file.path))
+                    .cloned()
+                    .unwrap_or_default();
                 self.setups.insert(file.file_id, setup);
                 self.prev_setups.insert(file.path.clone(), file.file_id);
             }
@@ -52,9 +58,11 @@ impl State {
 
             ui.vertical(|ui| {
                 for file in &loaded.files {
+                    let mut changed = false;
                     for sched_index in 0..file.order_list.schedules.len() {
                         let setup = self.setups.get_mut(&file.file_id).expect("inserted above");
                         let initial_num = &mut setup.initial.0[sched_index];
+                        let previous = *initial_num;
 
                         let order = file.order_list.find_schedule_order(sched_index);
                         let name = order
@@ -62,21 +70,27 @@ impl State {
                             .unwrap_or("(unassigned)");
                         ui.horizontal(|ui| {
                             ui.label(format!(
-                                    "{} sched#{} ({name})",
-                                    file.filename(),
-                                    sched_index + 1
+                                "{} sched#{} ({name})",
+                                file.filename(),
+                                sched_index + 1
                             ));
 
-                            let text = self.initial_texts.entry((file.file_id, sched_index)).or_insert_with(|| initial_num.to_string());
-                            number_edit(
-                                ui,
-                                text,
-                                initial_num,
-                                Some(0),
-                                Some(1000),
-                            );
+                            let text = self
+                                .initial_texts
+                                .entry((file.file_id, sched_index))
+                                .or_insert_with(|| initial_num.to_string());
+                            number_edit(ui, text, initial_num, Some(0), Some(1000));
                         });
-                    }}
+                        changed |= *initial_num != previous;
+                    }
+                    if changed {
+                        persist.data.chart_setups.insert(
+                            file.path.clone(),
+                            self.setups.get(&file.file_id).expect("inserted above").clone(),
+                        );
+                        persist.changed = true;
+                    }
+                }
             });
         });
         let result = match &self.cache {
@@ -133,7 +147,7 @@ impl State {
                     },
                     Err(err) => SimulationCache { cache_key, result: Err(format!("{err:?}")) },
                 };
-                self.plot.dest_permutation.resize(loaded);
+                self.plot.dest_permutation.resize(loaded, persist);
                 self.cache.insert(cache)
             }
         };
@@ -152,17 +166,28 @@ impl State {
 
         self.plot.ui(ui, loaded, display);
 
-        type PlotFn<'a> = Box<dyn Fn(&mut egui::Ui, &mut PlotConfig, &mut HoveredPair) + 'a>;
+        type PlotFn<'a> =
+            Box<dyn Fn(&mut egui::Ui, &mut PlotConfig, &mut HoveredPair, &mut Persist) + 'a>;
         let plots: Vec<PlotFn> = [
             self.plot.stringline.then(|| {
-                Box::new(|ui: &mut egui::Ui, plot: &mut PlotConfig, hovered: &mut HoveredPair| {
-                    show_stringline(ui, plot, loggers, display, loaded, hovered);
-                }) as PlotFn
+                Box::new(
+                    |ui: &mut egui::Ui,
+                     plot: &mut PlotConfig,
+                     hovered: &mut HoveredPair,
+                     persist: &mut Persist| {
+                        show_stringline(ui, plot, loggers, display, loaded, hovered, persist);
+                    },
+                ) as PlotFn
             }),
             self.plot.capacity.then(|| {
-                Box::new(|ui: &mut egui::Ui, plot: &mut PlotConfig, hovered: &mut HoveredPair| {
-                    show_capacity(ui, loggers, plot, display, loaded, hovered);
-                }) as PlotFn
+                Box::new(
+                    |ui: &mut egui::Ui,
+                     plot: &mut PlotConfig,
+                     hovered: &mut HoveredPair,
+                     persist: &mut Persist| {
+                        show_capacity(ui, loggers, plot, display, loaded, hovered, persist);
+                    },
+                ) as PlotFn
             }),
         ]
         .into_iter()
@@ -170,10 +195,10 @@ impl State {
         .collect();
         match &plots[..] {
             [] => {}
-            [p1] => p1(ui, &mut self.plot, &mut self.hovered),
+            [p1] => p1(ui, &mut self.plot, &mut self.hovered, persist),
             [p1, p2] => ui.columns_const(|[ui1, ui2]| {
-                p1(ui1, &mut self.plot, &mut self.hovered);
-                p2(ui2, &mut self.plot, &mut self.hovered);
+                p1(ui1, &mut self.plot, &mut self.hovered, persist);
+                p2(ui2, &mut self.plot, &mut self.hovered, persist);
             }),
             _ => unreachable!("we don't hae so many plots"),
         }
@@ -187,6 +212,7 @@ fn show_stringline(
     display: &DisplayInfo,
     loaded: &FileList,
     hovered: &mut HoveredPair,
+    persist: &mut Persist,
 ) {
     let (galleys, galley_margin) = prepare_galleys(ui, loaded, plot_config);
 
@@ -340,7 +366,7 @@ fn show_stringline(
         hovered.next.vehicle = Some(nearest);
     }
 
-    detect_hover(&resp, hovered, plot_config, &resolution);
+    detect_hover(&resp, hovered, plot_config, &resolution, persist);
     show_tooltip(
         &resp,
         &hovered.prev,
@@ -415,6 +441,7 @@ fn show_capacity(
     display: &DisplayInfo,
     loaded: &FileList,
     hovered: &mut HoveredPair,
+    persist: &mut Persist,
 ) {
     let avbl_size = ui.available_size();
     let resolution = plot_config.resolution(avbl_size, display, loaded, ui.next_widget_position());
@@ -542,7 +569,7 @@ fn show_capacity(
 
     draw_hovered_crosshair(&painter, plot_config, &resolution, &hovered.prev);
 
-    detect_hover(&resp, hovered, plot_config, &resolution);
+    detect_hover(&resp, hovered, plot_config, &resolution, persist);
     show_tooltip(
         &resp,
         &hovered.prev,
@@ -795,9 +822,9 @@ impl PlotConfig {
 
         let px_per_tick = (self.orientation.time(avbl_size).ceil() * self.time_scale)
             / ((display.end_time - display.start_time).0 as f32);
-        let num_orders =
-            if self.group_by_dest { self.dest_permutation.len() } else { counter };
-        let px_per_order = self.orientation.order(avbl_size) / (num_orders as f32) * self.order_scale;
+        let num_orders = if self.group_by_dest { self.dest_permutation.len() } else { counter };
+        let px_per_order =
+            self.orientation.order(avbl_size) / (num_orders as f32) * self.order_scale;
 
         Resolution {
             px_per_tick,
@@ -997,6 +1024,7 @@ fn detect_hover(
     hovered: &mut HoveredPair,
     plot_config: &mut PlotConfig,
     resolution: &Resolution,
+    persist: &mut Persist,
 ) {
     let tick_order =
         resp.hover_pos().map(|hover| resolution.pos_to_tick_order(&*plot_config, hover));
@@ -1027,9 +1055,11 @@ fn detect_hover(
     if let Some(dnd) = resp.dnd_release_payload::<DndPayload>() {
         plot_config.override_dest_pos_once = None;
         if let Some(tick_order) = tick_order {
-            plot_config
-                .dest_permutation
-                .relocate(dnd.initial_order, tick_order.display_pos.round() as usize);
+            plot_config.dest_permutation.relocate(
+                dnd.initial_order,
+                tick_order.display_pos.round() as usize,
+                persist,
+            );
         }
     }
 }
@@ -1095,7 +1125,7 @@ struct DestPermutation {
 impl DestPermutation {
     fn len(&self) -> usize { self.sorted.len() }
 
-    fn resize(&mut self, files: &FileList) {
+    fn resize(&mut self, files: &FileList, persist: &mut Persist) {
         let required: IndexSet<_> = files
             .files
             .iter()
@@ -1103,7 +1133,19 @@ impl DestPermutation {
             .filter_map(|order| order.typed.destination_id())
             .collect();
         self.sorted.retain(|v| required.contains(v));
-        self.sorted.extend(required);
+
+        for dest in required {
+            if self.sorted.contains(&dest) {
+                continue;
+            }
+
+            if persist.data.dest_order.insert(dest) {
+                persist.changed = true;
+            }
+            self.sorted.insert_sorted_by_key(dest, |d| {
+                persist.data.dest_order.get_index_of(d).unwrap_or(persist.data.dest_order.len())
+            });
+        }
     }
 
     fn find_by_dest(&self, dest: DestinationId) -> Option<usize> { self.sorted.get_index_of(&dest) }
@@ -1116,12 +1158,49 @@ impl DestPermutation {
         self.sorted.iter().copied().enumerate()
     }
 
-    fn relocate(&mut self, from: usize, to: usize) {
-        if from >= self.sorted.len() {
+    fn relocate(&mut self, from: usize, to: usize, persist: &mut Persist) {
+        if from == to || from >= self.sorted.len() {
             return;
         }
         let to = to.min(self.sorted.len() - 1);
         self.sorted.move_index(from, to);
+        let subj = self.sorted.get_index(to).unwrap();
+
+        let persist_order = &mut persist.data.dest_order;
+        if let Some(prev) = to.checked_sub(1) {
+            // use to-1 as anchor for persist relocation
+            let prev_dest = self.sorted.get_index(prev).expect("prev < to < sorted.len()");
+            if let Some(prev_persist_index) = persist_order.get_index_of(prev_dest)
+                && let Some(subj_persist_index) = persist_order.get_index_of(subj)
+            {
+                let move_target = if prev_persist_index < subj_persist_index {
+                    // prev_persist_index is unchanged after moving subj
+                    prev_persist_index + 1
+                } else {
+                    // prev_persist_index would shift leftward by one,
+                    // so subj would take its original place.
+                    prev_persist_index
+                };
+                persist_order
+                    .move_index(subj_persist_index, move_target.min(persist_order.len() - 1));
+            }
+        } else if let Some(next_dest) = self.sorted.get_index(to + 1) {
+            // use to+1 as anchor for persist relocation
+            if let Some(next_persist_index) = persist_order.get_index_of(next_dest)
+                && let Some(subj_persist_index) = persist_order.get_index_of(subj)
+            {
+                let move_target = if next_persist_index > subj_persist_index {
+                    // next_persist_index is unchanged after moving subj
+                    next_persist_index - 1 // 0 <= subj_persist_index < next_persist_index
+                } else {
+                    // next_persist_index would shift rightward by one,
+                    // so subj would take its original place.
+                    next_persist_index
+                };
+                persist_order.move_index(subj_persist_index, move_target);
+            }
+        }
+        persist.changed = true;
     }
 }
 

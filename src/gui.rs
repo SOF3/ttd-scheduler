@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
 use std::num::Wrapping;
 use std::ops::{AddAssign, SubAssign};
@@ -10,16 +10,32 @@ use std::sync::{Arc, atomic};
 
 use anyhow::Context;
 use egui::{CursorIcon, Label, Margin, TextEdit};
+use indexmap::IndexSet;
+use serde::{Deserialize, Serialize};
 
 mod charts;
 mod platform;
 use platform::Platform;
 
-use crate::schema::{OrderList, read_order_list_from_path};
+use crate::dispatch_flow;
+use crate::schema::{DestinationId, OrderList, read_order_list_from_path};
 
 #[derive(clap::Args)]
 pub struct Command {
     pub files: Vec<PathBuf>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PersistData {
+    chart_setups: HashMap<PathBuf, dispatch_flow::Args>,
+    dest_order:   IndexSet<DestinationId>,
+}
+
+#[derive(Default)]
+struct Persist {
+    data:    PersistData,
+    changed: bool,
 }
 
 impl Command {
@@ -29,6 +45,10 @@ impl Command {
             states:      States::default(),
             fps_counter: VecDeque::new(),
         };
+        match app.platform.read_persist_data() {
+            Ok(data) => app.states.persist.data = data,
+            Err(err) => log::error!("read persisted settings: {err:?}"),
+        }
         for file in &self.files {
             app.states.files.files.push(LoadedFile {
                 path:       file.clone(),
@@ -59,8 +79,9 @@ struct App {
 
 #[derive(Default)]
 struct States {
-    files:  FileList,
-    charts: charts::State,
+    files:   FileList,
+    charts:  charts::State,
+    persist: Persist,
 }
 
 #[derive(Default)]
@@ -89,8 +110,15 @@ impl eframe::App for App {
         egui::Frame::new().outer_margin(Margin::same(10)).show(ui, |ui| {
             self.choose_files(ui);
 
-            self.states.charts.ui(ui, &self.states.files);
+            self.states.charts.ui(ui, &self.states.files, &mut self.states.persist);
         });
+
+        if self.states.persist.changed {
+            match self.platform.write_persist_data(&self.states.persist.data) {
+                Ok(()) => self.states.persist.changed = false,
+                Err(err) => log::error!("write persisted settings: {err:?}"),
+            }
+        }
     }
 }
 
