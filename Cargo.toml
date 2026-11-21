@@ -2,6 +2,7 @@
 name = "ttd-scheduler"
 version = "0.1.0"
 edition = "2024"
+default-run = "ttd-scheduler"
 
 [[bin]]
 name = "web"

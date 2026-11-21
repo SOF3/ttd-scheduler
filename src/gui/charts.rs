@@ -364,6 +364,8 @@ fn show_stringline(
 
     draw_hovered_crosshair(&painter, plot_config, &resolution, &hovered.prev);
 
+    draw_time_ticks(&painter, plot_config, &resolution, display);
+
     let mut nearest_hovered_segment = None;
 
     for (file_index, (logger, file)) in loggers.iter().zip(&loaded.files).enumerate() {
@@ -820,11 +822,12 @@ struct PlotConfig {
     stringline: bool,
     capacity:   bool,
 
-    orientation:  Orientation,
-    time_scale:   f32,
-    time_offset:  Ticks,
-    order_scale:  f32,
-    order_offset: f32,
+    orientation:        Orientation,
+    time_scale:         f32,
+    time_offset:        Ticks,
+    order_scale:        f32,
+    order_offset:       f32,
+    time_ticks_density: usize,
 
     group_by_dest:        bool,
     vehicle_color_scheme: VehicleColorScheme,
@@ -839,11 +842,12 @@ impl Default for PlotConfig {
             stringline: true,
             capacity:   false,
 
-            orientation:  Orientation::HorizontalTime,
-            time_scale:   1.0,
-            time_offset:  Ticks(0),
-            order_scale:  1.0,
-            order_offset: 0.0,
+            orientation:        Orientation::HorizontalTime,
+            time_scale:         1.0,
+            time_offset:        Ticks(0),
+            order_scale:        1.0,
+            order_offset:       0.0,
+            time_ticks_density: 10,
 
             group_by_dest:        true,
             vehicle_color_scheme: VehicleColorScheme::StartingSchedule,
@@ -857,6 +861,12 @@ impl Default for PlotConfig {
 impl PlotConfig {
     fn ui(&mut self, ui: &mut egui::Ui, loaded: &FileList, display: &DisplayInfo) {
         ScrollArea::horizontal().show(ui, |ui| {
+            let (order_term, order_len) = if self.group_by_dest {
+                ("Location", self.dest_permutation.len())
+            } else {
+                ("Order", loaded.files.iter().map(|order| order.order_list.orders.len()).sum())
+            };
+
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.group_by_dest, "Group by destination");
 
@@ -879,6 +889,21 @@ impl PlotConfig {
                             VehicleColorScheme::Vehicle.to_string(),
                         );
                     });
+
+                ui.add(Slider::new(&mut self.time_ticks_density, 1..=30).text("Time axis lines"));
+
+                match self.orientation {
+                    Orientation::VerticalTime => {
+                        if ui.button(format!("Time / {order_term}")).clicked() {
+                            self.orientation = Orientation::HorizontalTime;
+                        }
+                    }
+                    Orientation::HorizontalTime => {
+                        if ui.button(format!("{order_term} / Time")).clicked() {
+                            self.orientation = Orientation::VerticalTime;
+                        }
+                    }
+                }
             });
 
             ui.horizontal(|ui| {
@@ -898,29 +923,11 @@ impl PlotConfig {
                     suffix
                 }));
 
-                let (order_term, order_len) = if self.group_by_dest {
-                    ("Location", self.dest_permutation.len())
-                } else {
-                    ("Order", loaded.files.iter().map(|order| order.order_list.orders.len()).sum())
-                };
                 ui.label(format!("{order_term} scale"));
                 ui.add(Slider::new(&mut self.order_scale, 0.5..=10.0).suffix("x"));
 
                 ui.label(format!("{order_term} offset"));
                 ui.add(Slider::new(&mut self.order_offset, 0.0..=order_len as f32).suffix(""));
-
-                match self.orientation {
-                    Orientation::VerticalTime => {
-                        if ui.button(format!("Time / {order_term}")).clicked() {
-                            self.orientation = Orientation::HorizontalTime;
-                        }
-                    }
-                    Orientation::HorizontalTime => {
-                        if ui.button(format!("{order_term} / Time")).clicked() {
-                            self.orientation = Orientation::VerticalTime;
-                        }
-                    }
-                }
             });
         });
     }
@@ -1080,6 +1087,12 @@ impl Resolution {
             Orientation::VerticalTime => [pos2(v, self.rect.min.y), pos2(v, self.rect.max.y)],
         }
     }
+
+    fn rendered_time_range(&self, config: &PlotConfig) -> [Ticks; 2] {
+        let start_ticks = self.pos_to_tick_order(config, self.rect.min).ticks;
+        let end_ticks = self.pos_to_tick_order(config, self.rect.max).ticks;
+        [start_ticks, end_ticks]
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1173,6 +1186,37 @@ fn draw_hovered_crosshair(
             resolution.full_order_line(plot_config, ResolveOrder::Exact(order)),
             Stroke::new(1.0, Color32::from_rgb(220, 160, 160)),
         );
+    }
+}
+
+fn draw_time_ticks(
+    painter: &Painter,
+    plot_config: &PlotConfig,
+    resolution: &Resolution,
+    display: &DisplayInfo,
+) {
+    let rendered_range = resolution.rendered_time_range(plot_config);
+    let interval = (rendered_range[1] - rendered_range[0]) / plot_config.time_ticks_density;
+    let start = rendered_range[0] + interval / 2;
+
+    for index in 0..plot_config.time_ticks_density {
+        let ticks = start + interval * index;
+        let line = resolution.full_tick_line(plot_config, ticks);
+        painter.line_segment(line, Stroke::new(1.0, Color32::from_rgb(160, 80, 200)));
+
+        let text_pos = match plot_config.orientation {
+            Orientation::HorizontalTime => pos2(line[0].x, resolution.rect.min.y + 10.0),
+            Orientation::VerticalTime => pos2(resolution.rect.min.x + 10.0, line[0].y),
+        };
+        if let Ok(timestamp) = Timestamp::from_ticks(ticks, display.tpm) {
+            painter.text(
+                text_pos,
+                Align2::CENTER_TOP,
+                timestamp.to_string(),
+                FontId::new(12.0, FontFamily::Proportional),
+                Color32::WHITE,
+            );
+        }
     }
 }
 

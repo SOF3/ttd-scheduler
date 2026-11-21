@@ -5,8 +5,8 @@ use std::num::Wrapping;
 use std::ops::{AddAssign, SubAssign};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use egui::{CursorIcon, Label, Margin, TextEdit};
 use indexmap::IndexSet;
@@ -52,7 +52,10 @@ impl Command {
                         .context("read order list file")?,
                 ),
                 file_id:    FileId(
-                    app.states.files.next_file_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    app.states
+                        .files
+                        .next_file_id
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 ),
             });
         }
