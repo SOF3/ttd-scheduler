@@ -26,7 +26,7 @@ impl super::Platform for Native {
             if let Some(dir) = files
                 .files
                 .last()
-                .and_then(|last| last.path.parent().map(PathBuf::from))
+                .and_then(|last| last.path.ancestors().find(|p| p.is_dir()).map(PathBuf::from))
                 .or_else(openttd_order_lists_dir)
             {
                 dialog = dialog.set_directory(dir);

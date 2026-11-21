@@ -1520,7 +1520,7 @@ impl DestPermutation {
                                 None
                             }
                         })
-                        .unwrap_or_else(|| Coords { x: 0, y: 0 })
+                        .unwrap_or(Coords { x: 0, y: 0 })
                 })
                 .collect();
 
