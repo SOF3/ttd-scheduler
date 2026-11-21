@@ -288,6 +288,19 @@ pub trait Logger {
     fn step(&mut self, order_list: &OrderList, time: Ticks, state: &State);
 
     fn missed_dispatch_slot(&mut self, schedule_index: usize, slot: usize, time: Ticks);
+
+    fn arrival(&mut self, time: Ticks, vehicle_id: usize, order_index: usize) {
+        _ = (time, vehicle_id, order_index);
+    }
+
+    fn departure(&mut self, time: Ticks, vehicle_id: usize, order_index: usize) {
+        _ = (time, vehicle_id, order_index);
+    }
+
+    /// Used for go-via orders.
+    fn via(&mut self, time: Ticks, vehicle_id: usize, order_index: usize) {
+        _ = (time, vehicle_id, order_index);
+    }
 }
 
 struct Context<'a> {
@@ -349,12 +362,15 @@ impl State {
         let eta = match vehicle.action {
             VehicleAction::Waiting | VehicleAction::PendingDispatch => {
                 // departure
+                logger.departure(current_time, vehicle_id, vehicle.current_order);
                 vehicle.next_order(ctx, current_time)?
             }
             VehicleAction::Traveling { .. } => {
                 // arrival
                 let order = &ctx.order_list.orders[vehicle.current_order];
                 let (eta, action) = if let Some(schedule_index) = order.schedule_index {
+                    logger.arrival(current_time, vehicle_id, vehicle.current_order);
+
                     let schedule = ctx
                         .order_list
                         .schedules
@@ -369,9 +385,13 @@ impl State {
                 } else {
                     match order.typed {
                         OrderTyped::GoToStation { wait_time, .. } => {
+                            logger.arrival(current_time, vehicle_id, vehicle.current_order);
                             (current_time + wait_time, VehicleAction::Waiting)
                         }
-                        OrderTyped::GoToWaypoint { .. } => (current_time, VehicleAction::Waiting),
+                        OrderTyped::GoToWaypoint { .. } => {
+                            logger.via(current_time, vehicle_id, vehicle.current_order);
+                            (current_time, VehicleAction::Waiting)
+                        }
                         OrderTyped::Conditional { .. } => unreachable!(
                             "vehicle must not be put on heap when current order is conditional"
                         ),

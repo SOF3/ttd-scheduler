@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap};
 use std::f32::consts::GOLDEN_RATIO;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::num::Wrapping;
@@ -21,7 +21,7 @@ use ordered_float::OrderedFloat;
 use crate::dispatch_flow::{self, DisplayInfo, VehicleList};
 use crate::gui::{FileId, FileList, Persist, number_edit};
 use crate::schema::{
-    self, DestinationId, Duration, OrderList, OrderTyped, Route, Ticks, Timestamp,
+    self, Coords, DestinationId, Duration, OrderList, OrderTyped, Route, Ticks, Timestamp,
 };
 
 const ORDER_WRAP_THRESHOLD: f32 = 0.7;
@@ -263,6 +263,10 @@ impl State {
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.plot.stringline, "Stringline");
             ui.checkbox(&mut self.plot.capacity, "Capacity chart");
+
+            if ui.button("Regression sort").clicked() {
+                self.plot.dest_permutation.regression_sort(loaded, persist);
+            }
         });
 
         self.plot.ui(ui, loaded, display);
@@ -474,6 +478,23 @@ fn show_stringline(
                     }
                 }
             }
+        }
+    }
+
+    for (file_index, logger) in loggers.iter().enumerate() {
+        for adv in &logger.adv_marks {
+            let pos = resolution.tick_order_to_pos(
+                plot_config,
+                adv.time,
+                ResolveOrder::Exact(OrderRef { file_index, order_index: adv.order }),
+            );
+            painter.text(
+                pos,
+                Align2::CENTER_CENTER,
+                adv.char,
+                FontId::new(10.0, FontFamily::Proportional),
+                ui.visuals().warn_fg_color,
+            );
         }
     }
 
@@ -717,15 +738,7 @@ struct Logger {
     steps:        Vec<StepLog>,
     missed_slots: Vec<MissedSlot>,
     vehicle_list: VehicleList,
-}
-
-impl Logger {
-    fn binary_search_step(&self, time: Ticks) -> Option<&StepLog> {
-        self.steps
-            .partition_point(|step| step.time <= time)
-            .checked_sub(1)
-            .and_then(|index| self.steps.get(index))
-    }
+    adv_marks:    Vec<AdvMark>,
 }
 
 struct StepLog {
@@ -747,6 +760,21 @@ struct OrderStepLog {
 struct MissedSlot {
     schedule_index: usize,
     time:           Ticks,
+}
+
+struct AdvMark {
+    time:  Ticks,
+    order: usize,
+    char:  char,
+}
+
+impl Logger {
+    fn binary_search_step(&self, time: Ticks) -> Option<&StepLog> {
+        self.steps
+            .partition_point(|step| step.time <= time)
+            .checked_sub(1)
+            .and_then(|index| self.steps.get(index))
+    }
 }
 
 impl dispatch_flow::Logger for Logger {
@@ -785,6 +813,28 @@ impl dispatch_flow::Logger for Logger {
 
     fn missed_dispatch_slot(&mut self, schedule_index: usize, _slot: usize, time: Ticks) {
         self.missed_slots.push(MissedSlot { schedule_index, time });
+    }
+
+    fn arrival(&mut self, time: Ticks, _: usize, order_index: usize) {
+        self.adv_marks.push(AdvMark { time, order: order_index, char: 'A' });
+    }
+
+    fn departure(&mut self, time: Ticks, _: usize, order_index: usize) {
+        if let Some(overlap) = self
+            .adv_marks
+            .iter_mut()
+            .rev()
+            .take_while(|mark| mark.time == time)
+            .find(|mark| mark.order == order_index)
+        {
+            overlap.char = 'V';
+        } else {
+            self.adv_marks.push(AdvMark { time, order: order_index, char: 'D' });
+        }
+    }
+
+    fn via(&mut self, time: Ticks, _: usize, order_index: usize) {
+        self.adv_marks.push(AdvMark { time, order: order_index, char: 'V' });
     }
 }
 
@@ -1402,6 +1452,47 @@ impl DestPermutation {
             }
         }
         persist.changed = true;
+    }
+
+    fn regression_sort(&mut self, loaded: &FileList, persist: &mut Persist) {
+        if self.len() < 2 {
+            return;
+        }
+
+        let mut dests: Vec<_> = self.sorted.iter().copied().enumerate().collect();
+        {
+            let positions: Vec<_> = dests.iter().map(|&(_, dest)| {
+                loaded.files.iter().flat_map(|file| &file.order_list.orders)
+                    .find_map(|order| if order.typed.destination_id() == Some(dest) { order.typed.destination_location()} else {None})
+                    .unwrap_or_else(|| Coords { x: 0, y: 0})
+            }).collect();
+
+            let mut matrix = nalgebra::Matrix2xX::from_iterator(dests.len(), positions.iter().flat_map(|coords| [coords.x as f64, coords.y as f64]));
+            let centroid: nalgebra::Matrix2x1<f64> = matrix.column_mean();
+            for mut position in matrix.column_iter_mut() {
+                position -= centroid;
+            }
+            let Some(upper_singular) = matrix.clone().svd(true, false).u else {
+                log::error!("SVD decomposition failed");
+                return;
+            };
+            let direction = upper_singular.column(0);
+            let projected = direction.transpose() * matrix;
+
+            dests.sort_by_key(|&(index, _)|  OrderedFloat(projected[index]) );
+        }
+
+        // for simplicity we bubble sort the permutation to update persist simultaneously
+        let mut offset_indices = (0..dests.len()).collect::<Vec<_>>();
+        for (new_index, (old_index, _)) in dests.into_iter().enumerate() {
+            let current_index = offset_indices[old_index];
+            self.relocate(current_index, new_index, persist);
+            for offset_index in &mut offset_indices {
+                if (new_index..current_index).contains(offset_index) {
+                    *offset_index += 1;
+                }
+            }
+        }
     }
 }
 
