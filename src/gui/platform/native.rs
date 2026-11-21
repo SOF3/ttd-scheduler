@@ -5,10 +5,10 @@ use std::sync::atomic;
 
 use anyhow::Context;
 use futures::executor::block_on;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 
 use crate::gui::{FileId, FileList, LoadedFile, PersistData};
-use crate::schema::read_order_list_from_str;
+use crate::schema::read_order_lists_from_str;
 
 #[derive(Default)]
 pub struct Native {
@@ -39,12 +39,24 @@ impl super::Platform for Native {
                         let contents = file.read().await;
                         let contents =
                             String::from_utf8(contents).context("file contains invalid utf-8")?;
+                        let lists = read_order_lists_from_str(&contents)?;
+                        anyhow::Ok(stream::iter(lists.into_iter().map(
+                            move |(subpaths, order_list)| {
+                                let mut path = file.path().to_path_buf();
+                                for subpath in subpaths {
+                                    path.push(subpath);
+                                }
+                                anyhow::Ok((path, order_list))
+                            },
+                        )))
+                    })
+                    .try_flatten()
+                    .map(|result| {
+                        let (path, order_list) = result?;
                         Ok(LoadedFile {
-                            path:       file.path().to_path_buf(),
-                            order_list: Box::new(read_order_list_from_str(&contents)?),
-                            file_id:    FileId(
-                                next_file_id.fetch_add(1, atomic::Ordering::Relaxed),
-                            ),
+                            path,
+                            order_list,
+                            file_id: FileId(next_file_id.fetch_add(1, atomic::Ordering::Relaxed)),
                         })
                     })
                     .collect()

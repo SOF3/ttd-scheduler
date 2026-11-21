@@ -9,8 +9,23 @@ use arrayvec::ArrayVec;
 use derive_more::{Add, AddAssign, Sub, SubAssign};
 use serde::{Deserialize, Serialize};
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct Nested {
+    children:   Vec<Nested>,
+    group_name: String,
+    orderlists: Vec<OrderListWithVehicles>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "type")]
+#[serde(rename_all = "kebab-case")]
+pub struct OrderListWithVehicles {
+    pub order_data: Box<OrderList>,
+    pub vehicles:   Vec<u32>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct OrderList {
     pub orders:          Vec<Order>,
     pub schedules:       Vec<Schedule>,
@@ -27,13 +42,13 @@ impl OrderList {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "type")]
+#[serde(rename_all = "kebab-case")]
 pub struct GameProperties {
     pub ticks_per_minute: Ticks,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "type")]
+#[serde(rename_all = "kebab-case")]
 pub struct Order {
     pub jump_from:      Option<JumpToken>,
     #[serde(flatten)]
@@ -241,6 +256,46 @@ pub fn read_order_list_from_path(path: &Path) -> anyhow::Result<OrderList> {
 fn try_read_order_list_from_path(path: &Path) -> anyhow::Result<OrderList> {
     let contents = fs::read_to_string(path).context("open config")?;
     read_order_list_from_str(&contents)
+}
+
+pub fn read_order_lists_from_str(
+    contents: &str,
+) -> anyhow::Result<Vec<(Vec<String>, Box<OrderList>)>> {
+    fn yield_order_lists(
+        prefix: &mut Vec<String>,
+        output: &mut Vec<(Vec<String>, Box<OrderList>)>,
+        node: Nested,
+    ) {
+        for (i, order_list) in node.orderlists.into_iter().enumerate() {
+            prefix.push(format!("{}:{i}", node.group_name));
+            output.push((prefix.clone(), order_list.order_data));
+            prefix.pop();
+        }
+
+        prefix.push(node.group_name);
+        for child in node.children {
+            yield_order_lists(prefix, output, child);
+        }
+        prefix.pop();
+    }
+
+    let mut output = Vec::new();
+
+    let nested: Result<Nested, _> = serde_json::from_str(contents).context("parse config");
+    match nested {
+        Ok(nested) => yield_order_lists(&mut Vec::new(), &mut output, nested),
+        Err(err_nested) => {
+            let raw: Result<Box<OrderList>, _> =
+                serde_json::from_str(contents).context("parse config");
+            match raw {
+                Ok(raw) => output.push((Vec::new(), raw)),
+                Err(err_raw) => {
+                    return Err(anyhow::anyhow!("{err_nested:?}\n+ {err_raw:?}"));
+                }
+            }
+        }
+    }
+    Ok(output)
 }
 
 pub fn read_order_list_from_str(contents: &str) -> anyhow::Result<OrderList> {

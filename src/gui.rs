@@ -8,7 +8,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use egui::{CursorIcon, Label, Margin, TextEdit};
+use egui::{CursorIcon, Label, Margin, ScrollArea, TextEdit};
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
 
@@ -43,21 +43,32 @@ impl Command {
     pub fn run(&self) -> anyhow::Result<()> {
         use anyhow::Context;
 
+        fn read_file(states: &mut States, file: &PathBuf) -> anyhow::Result<()> {
+            let contents = std::fs::read_to_string(file).context("read order lists file")?;
+            for (subpaths, order_list) in crate::schema::read_order_lists_from_str(&contents)
+                .context("parse order list file")?
+            {
+                let mut path = file.clone();
+                for subpath in subpaths {
+                    path.push(subpath);
+                }
+                states.files.files.push(LoadedFile {
+                    path,
+                    order_list,
+                    file_id: FileId(
+                        states
+                            .files
+                            .next_file_id
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    ),
+                });
+            }
+            Ok(())
+        }
+
         let mut app = App::new(platform::Native::default());
         for file in &self.files {
-            app.states.files.files.push(LoadedFile {
-                path:       file.clone(),
-                order_list: Box::new(
-                    crate::schema::read_order_list_from_path(file)
-                        .context("read order list file")?,
-                ),
-                file_id:    FileId(
-                    app.states
-                        .files
-                        .next_file_id
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                ),
-            });
+            read_file(&mut app.states, file).context(file.display().to_string())?;
         }
 
         eframe::run_native(
@@ -121,10 +132,25 @@ impl eframe::App for App {
             ui.add(Label::new(format!("FPS: {fps}")));
         }
 
-        egui::Frame::new().outer_margin(Margin::same(10)).show(ui, |ui| {
-            self.choose_files(ui);
+        egui::Panel::top("global top")
+            .resizable(true)
+            .frame(egui::Frame::new().outer_margin(Margin::same(10)))
+            .show(ui, |ui| {
+                ScrollArea::vertical()
+                    .id_salt("global top scroll")
+                    .max_width(ui.content_rect().width())
+                    .show(ui, |ui| {
+                        self.choose_files(ui);
+                        self.states.charts.render_header(
+                            ui,
+                            &self.states.files,
+                            &mut self.states.persist,
+                        );
+                    });
+            });
 
-            self.states.charts.ui(ui, &self.states.files, &mut self.states.persist);
+        egui::CentralPanel::no_frame().show(ui, |ui| {
+            self.states.charts.render_plots(ui, &self.states.files, &mut self.states.persist);
         });
 
         if self.states.persist.changed {

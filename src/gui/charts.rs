@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::{HashMap};
+use std::collections::HashMap;
 use std::f32::consts::GOLDEN_RATIO;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::num::Wrapping;
@@ -19,9 +19,9 @@ use indexmap::IndexSet;
 use ordered_float::OrderedFloat;
 
 use crate::dispatch_flow::{self, DisplayInfo, VehicleList};
-use crate::gui::{FileId, FileList, Persist, number_edit};
+use crate::gui::{FileId, FileList, LoadedFile, Persist, number_edit};
 use crate::schema::{
-    self, Coords, DestinationId, Duration, OrderList, OrderTyped, Route, Ticks, Timestamp,
+    self, Coords, DestinationId, Duration, OrderList, OrderTyped, Route, Schedule, Ticks, Timestamp,
 };
 
 const ORDER_WRAP_THRESHOLD: f32 = 0.7;
@@ -50,7 +50,7 @@ struct ExtraSlotState {
 }
 
 impl State {
-    pub fn ui(&mut self, ui: &mut egui::Ui, loaded: &FileList, persist: &mut Persist) {
+    pub fn render_header(&mut self, ui: &mut egui::Ui, loaded: &FileList, persist: &mut Persist) {
         if loaded.files.is_empty() {
             return;
         }
@@ -73,130 +73,45 @@ impl State {
             setup.initial.0.resize(file.order_list.schedules.len(), 0);
         }
 
+        self.show_schedule_configs(ui, loaded, persist);
+
+        let (_, display) = match Self::ensure_cache(
+            &self.setups,
+            &mut self.cache,
+            &mut self.plot,
+            loaded,
+            persist,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                ui.colored_label(egui::Color32::RED, err);
+                return;
+            }
+        };
+
         ui.horizontal(|ui| {
-            ui.label("Starting vehicles:");
+            ui.checkbox(&mut self.plot.stringline, "Stringline");
+            ui.checkbox(&mut self.plot.capacity, "Capacity chart");
 
-            for (file_index, file) in loaded.files.iter().enumerate() {
-                ui.vertical(|ui| {
-                    let mut changed = false;
-                    for (sched_index, sched) in file.order_list.schedules.iter().enumerate() {
-                        let setup = self.setups.get_mut(&file.file_id).expect("inserted above");
-                        let initial_num = &mut setup.initial.0[sched_index];
-                        let previous = *initial_num;
-
-                        let order = file.order_list.find_schedule_order(sched_index);
-                        let name = order
-                            .and_then(|(_, order)| order.typed.destination_name())
-                            .unwrap_or("(unassigned)");
-                        ui.horizontal(|ui| {
-                            ui.label(format!(
-                                "{} sched#{} ({name})",
-                                file.filename(),
-                                sched_index + 1
-                            ));
-
-                            let text = self
-                                .initial_texts
-                                .entry((file.file_id, sched_index))
-                                .or_insert_with(|| initial_num.to_string());
-                            number_edit(ui, text, initial_num, Some(0), Some(1000));
-
-                            let mut delete_extra_slots = Vec::new();
-                            for (extra_index, extra_slot) in
-                                setup.with_extra_slots.iter().enumerate()
-                            {
-                                if extra_slot.schedule_index == sched_index {
-                                    if ui
-                                        .colored_label(Color32::RED, "X")
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                        .clicked()
-                                    {
-                                        delete_extra_slots.push(extra_index);
-                                    }
-                                    ui.label(extra_slot.slot_time.to_string()).on_hover_text(
-                                        format!(
-                                            "Route: {}",
-                                            match &extra_slot.route {
-                                                None => Cow::Borrowed("Default"),
-                                                Some(route) =>
-                                                    sched.route_ids.get(route).map_or_else(
-                                                        || format!("route {}", route.0).into(),
-                                                        |s| Cow::Borrowed(s.as_str())
-                                                    ),
-                                            }
-                                        ),
-                                    );
-                                }
-                            }
-                            let mut i = 0;
-                            setup.with_extra_slots.retain(|_| {
-                                let delete = delete_extra_slots.contains(&i);
-                                i += 1;
-                                !delete
-                            });
-
-                            ui.push_id(("extra slot", file_index, sched_index), |ui| {
-                                let add_button = ui.button("Add temp slot");
-                                Popup::from_response(&add_button)
-                                    .kind(PopupKind::Menu)
-                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                                    .open_memory(
-                                        add_button.clicked().then_some(SetOpenCommand::Bool(true)),
-                                    )
-                                    .show(|ui| {
-                                        let texts = &mut self.extra_slot;
-                                        number_edit(
-                                            ui,
-                                            &mut texts.add_hour_text,
-                                            &mut texts.add_hour_num,
-                                            Some(0),
-                                            Some(23),
-                                        );
-                                        number_edit(
-                                            ui,
-                                            &mut texts.add_minute_text,
-                                            &mut texts.add_minute_num,
-                                            Some(0),
-                                            Some(59),
-                                        );
-                                        ui.selectable_value(&mut texts.route, None, "Default");
-                                        for (&route, route_name) in sched.route_ids.iter() {
-                                            ui.selectable_value(
-                                                &mut texts.route,
-                                                Some(route),
-                                                route_name,
-                                            );
-                                        }
-                                        if ui.button("Add").clicked() {
-                                            setup.with_extra_slots.push(dispatch_flow::ExtraSlot {
-                                                schedule_index: sched_index,
-                                                slot_time:      Timestamp {
-                                                    hours:   texts.add_hour_num,
-                                                    minutes: texts.add_minute_num,
-                                                },
-                                                route:          texts.route,
-                                                tags:           ArrayVec::new(), // TODO
-                                            });
-                                        }
-                                    });
-                            });
-                        });
-                        changed |= *initial_num != previous;
-                    }
-                    if changed {
-                        persist.data.chart_setups.insert(
-                            file.path.clone(),
-                            self.setups.get(&file.file_id).expect("inserted above").clone(),
-                        );
-                        persist.changed = true;
-                    }
-                });
+            if ui.button("Regression sort").clicked() {
+                self.plot.dest_permutation.regression_sort(loaded, persist);
             }
         });
-        let result = match &self.cache {
+
+        self.plot.ui(ui, loaded, display);
+    }
+
+    fn ensure_cache<'cache>(
+        setups: &HashMap<FileId, dispatch_flow::Args>,
+        cache_opt: &'cache mut Option<SimulationCache>,
+        plot_config: &mut PlotConfig,
+        loaded: &FileList,
+        persist: &mut Persist,
+    ) -> &'cache Result<(Vec<Logger>, DisplayInfo), String> {
+        let result = match &*cache_opt {
             Some(result)
                 if result.cache_key.generation != loaded.generation
-                    || result.cache_key.setups != self.setups =>
+                    || result.cache_key.setups != *setups =>
             {
                 None
             }
@@ -212,7 +127,7 @@ impl State {
                     .iter()
                     .map(|file| {
                         let mut logger = Logger::default();
-                        let setup = self.setups.get(&file.file_id).expect("inserted above");
+                        let setup = setups.get(&file.file_id).expect("inserted above");
                         match setup.simulate(&file.order_list, &mut logger) {
                             Ok(d) => {
                                 logger.vehicle_list = d.vehicles.clone();
@@ -238,7 +153,7 @@ impl State {
 
                 let cache_key = SimulationCacheKey {
                     generation: loaded.generation,
-                    setups:     self.setups.clone(),
+                    setups:     setups.clone(),
                 };
 
                 let cache = match result {
@@ -248,33 +163,163 @@ impl State {
                     },
                     Err(err) => SimulationCache { cache_key, result: Err(format!("{err:?}")) },
                 };
-                self.plot.dest_permutation.resize(loaded, persist);
-                self.cache.insert(cache)
+                plot_config.dest_permutation.resize(loaded, persist);
+                cache_opt.insert(cache)
             }
         };
 
-        let (loggers, display) = match &result.result {
-            Ok(data) => data,
-            Err(err) => {
-                ui.colored_label(egui::Color32::RED, err);
-                return;
-            }
-        };
+        &result.result
+    }
+
+    fn show_schedule_configs(
+        &mut self,
+        ui: &mut egui::Ui,
+        loaded: &FileList,
+        persist: &mut Persist,
+    ) {
+        ScrollArea::horizontal()
+            .id_salt("schedule configs")
+            .max_width(ui.content_rect().width())
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    for (file_index, file) in loaded.files.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(file.filename());
+
+                            let mut changed = false;
+                            for (sched_index, sched) in file.order_list.schedules.iter().enumerate()
+                            {
+                                self.show_schedule_config(
+                                    ui,
+                                    file_index,
+                                    file,
+                                    sched_index,
+                                    sched,
+                                    &mut changed,
+                                );
+                            }
+                            if changed {
+                                persist.data.chart_setups.insert(
+                                    file.path.clone(),
+                                    self.setups.get(&file.file_id).expect("inserted above").clone(),
+                                );
+                                persist.changed = true;
+                            }
+                        });
+                    }
+                });
+            });
+    }
+
+    fn show_schedule_config(
+        &mut self,
+        ui: &mut egui::Ui,
+        file_index: usize,
+        file: &LoadedFile,
+        sched_index: usize,
+        sched: &Schedule,
+        changed: &mut bool,
+    ) {
+        let setup = self.setups.get_mut(&file.file_id).expect("inserted above");
+        let initial_num = &mut setup.initial.0[sched_index];
+        let previous = *initial_num;
+
+        let order = file.order_list.find_schedule_order(sched_index);
+        let name =
+            order.and_then(|(_, order)| order.typed.destination_name()).unwrap_or("(unassigned)");
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.plot.stringline, "Stringline");
-            ui.checkbox(&mut self.plot.capacity, "Capacity chart");
+            ui.label(format!("sched#{} ({name})", sched_index + 1));
 
-            if ui.button("Regression sort").clicked() {
-                self.plot.dest_permutation.regression_sort(loaded, persist);
+            let text = self
+                .initial_texts
+                .entry((file.file_id, sched_index))
+                .or_insert_with(|| initial_num.to_string());
+            number_edit(ui, text, initial_num, Some(0), Some(1000));
+
+            let mut delete_extra_slots = Vec::new();
+            for (extra_index, extra_slot) in setup.with_extra_slots.iter().enumerate() {
+                if extra_slot.schedule_index == sched_index {
+                    if ui
+                        .colored_label(Color32::RED, "X")
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        delete_extra_slots.push(extra_index);
+                    }
+                    ui.label(extra_slot.slot_time.to_string()).on_hover_text(format!(
+                        "Route: {}",
+                        match &extra_slot.route {
+                            None => Cow::Borrowed("Default"),
+                            Some(route) => sched.route_ids.get(route).map_or_else(
+                                || format!("route {}", route.0).into(),
+                                |s| Cow::Borrowed(s.as_str())
+                            ),
+                        }
+                    ));
+                }
             }
+            let mut i = 0;
+            setup.with_extra_slots.retain(|_| {
+                let delete = delete_extra_slots.contains(&i);
+                i += 1;
+                !delete
+            });
+
+            ui.push_id(("extra slot", file_index, sched_index), |ui| {
+                let add_button = ui.button("Add temp slot");
+                Popup::from_response(&add_button)
+                    .kind(PopupKind::Menu)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .open_memory(add_button.clicked().then_some(SetOpenCommand::Bool(true)))
+                    .show(|ui| {
+                        let texts = &mut self.extra_slot;
+                        number_edit(
+                            ui,
+                            &mut texts.add_hour_text,
+                            &mut texts.add_hour_num,
+                            Some(0),
+                            Some(23),
+                        );
+                        number_edit(
+                            ui,
+                            &mut texts.add_minute_text,
+                            &mut texts.add_minute_num,
+                            Some(0),
+                            Some(59),
+                        );
+                        ui.selectable_value(&mut texts.route, None, "Default");
+                        for (&route, route_name) in sched.route_ids.iter() {
+                            ui.selectable_value(&mut texts.route, Some(route), route_name);
+                        }
+                        if ui.button("Add").clicked() {
+                            setup.with_extra_slots.push(dispatch_flow::ExtraSlot {
+                                schedule_index: sched_index,
+                                slot_time:      Timestamp {
+                                    hours:   texts.add_hour_num,
+                                    minutes: texts.add_minute_num,
+                                },
+                                route:          texts.route,
+                                tags:           ArrayVec::new(), // TODO
+                            });
+                        }
+                    });
+            });
         });
+        *changed |= *initial_num != previous;
+    }
 
-        self.plot.ui(ui, loaded, display);
-
+    pub fn render_plots(&mut self, ui: &mut egui::Ui, loaded: &FileList, persist: &mut Persist) {
         type PlotFn<'a> = Box<
             dyn Fn(&mut egui::Ui, &mut PlotConfig, &mut HoveredPair, &mut Persist, &mut Palette)
                 + 'a,
         >;
+
+        let Ok((loggers, display)) =
+            Self::ensure_cache(&self.setups, &mut self.cache, &mut self.plot, loaded, persist)
+        else {
+            return;
+        };
+
         let plots: Vec<PlotFn> = [
             self.plot.stringline.then(|| {
                 Box::new(
@@ -910,7 +955,7 @@ impl Default for PlotConfig {
 
 impl PlotConfig {
     fn ui(&mut self, ui: &mut egui::Ui, loaded: &FileList, display: &DisplayInfo) {
-        ScrollArea::horizontal().show(ui, |ui| {
+        ScrollArea::horizontal().id_salt("PlotConfig").show(ui, |ui| {
             let (order_term, order_len) = if self.group_by_dest {
                 ("Location", self.dest_permutation.len())
             } else {
@@ -1461,13 +1506,28 @@ impl DestPermutation {
 
         let mut dests: Vec<_> = self.sorted.iter().copied().enumerate().collect();
         {
-            let positions: Vec<_> = dests.iter().map(|&(_, dest)| {
-                loaded.files.iter().flat_map(|file| &file.order_list.orders)
-                    .find_map(|order| if order.typed.destination_id() == Some(dest) { order.typed.destination_location()} else {None})
-                    .unwrap_or_else(|| Coords { x: 0, y: 0})
-            }).collect();
+            let positions: Vec<_> = dests
+                .iter()
+                .map(|&(_, dest)| {
+                    loaded
+                        .files
+                        .iter()
+                        .flat_map(|file| &file.order_list.orders)
+                        .find_map(|order| {
+                            if order.typed.destination_id() == Some(dest) {
+                                order.typed.destination_location()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_else(|| Coords { x: 0, y: 0 })
+                })
+                .collect();
 
-            let mut matrix = nalgebra::Matrix2xX::from_iterator(dests.len(), positions.iter().flat_map(|coords| [coords.x as f64, coords.y as f64]));
+            let mut matrix = nalgebra::Matrix2xX::from_iterator(
+                dests.len(),
+                positions.iter().flat_map(|coords| [coords.x as f64, coords.y as f64]),
+            );
             let centroid: nalgebra::Matrix2x1<f64> = matrix.column_mean();
             for mut position in matrix.column_iter_mut() {
                 position -= centroid;
@@ -1479,7 +1539,7 @@ impl DestPermutation {
             let direction = upper_singular.column(0);
             let projected = direction.transpose() * matrix;
 
-            dests.sort_by_key(|&(index, _)|  OrderedFloat(projected[index]) );
+            dests.sort_by_key(|&(index, _)| OrderedFloat(projected[index]));
         }
 
         // for simplicity we bubble sort the permutation to update persist simultaneously
