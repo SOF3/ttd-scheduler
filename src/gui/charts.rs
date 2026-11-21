@@ -1,7 +1,6 @@
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::f32::consts::GOLDEN_RATIO;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::num::Wrapping;
 use std::path::PathBuf;
@@ -1617,10 +1616,22 @@ fn hash_to_rgb(palette: &mut Palette, salt: impl fmt::Debug + Hash + Any) -> Col
     salt.hash(&mut hasher);
     let hash = hasher.finish();
 
+    let len = palette.colors.len();
     *palette.colors.entry(hash).or_insert_with(|| {
-        let hash_u16 =
-            (hash as u16) ^ ((hash >> 16) as u16) ^ ((hash >> 32) as u16) ^ ((hash >> 48) as u16);
-        let hue = GOLDEN_RATIO.fract() * (hash_u16 as f32 / u16::MAX as f32);
-        Color32::from(Hsva::new(hue.fract(), 0.65, 0.95, 1.0))
+        let hue = bvdc(len);
+        let sat = 0.95 - bvdc(len * 2) * 0.3;
+        Color32::from(Hsva::new(hue, sat, 0.95, 1.0))
     })
+}
+
+fn bvdc(n: usize) -> f32 {
+    a030101(n as u64) as f32 / a062383(n as u64) as f32
+}
+
+fn a030101(n: u64) -> u64 {
+    if n == 0 { 0 } else { n.reverse_bits() >> n.leading_zeros() }
+}
+
+fn a062383(n: u64) -> u64 {
+    if n == 0 { 1 } else { 1 << (u64::BITS - n.leading_zeros()) }
 }
