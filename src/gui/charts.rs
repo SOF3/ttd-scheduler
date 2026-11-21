@@ -313,6 +313,10 @@ impl State {
                 + 'a,
         >;
 
+        if loaded.files.is_empty() {
+            return;
+        }
+
         let Ok((loggers, display)) =
             Self::ensure_cache(&self.setups, &mut self.cache, &mut self.plot, loaded, persist)
         else {
@@ -1624,14 +1628,8 @@ fn hash_to_rgb(palette: &mut Palette, salt: impl fmt::Debug + Hash + Any) -> Col
     })
 }
 
-fn bvdc(n: usize) -> f32 {
-    a030101(n as u64) as f32 / a062383(n as u64) as f32
-}
+fn bvdc(n: usize) -> f32 { a030101(n as u64) as f32 / a062383(n as u64) as f32 }
 
-fn a030101(n: u64) -> u64 {
-    if n == 0 { 0 } else { n.reverse_bits() >> n.leading_zeros() }
-}
+fn a030101(n: u64) -> u64 { if n == 0 { 0 } else { n.reverse_bits() >> n.leading_zeros() } }
 
-fn a062383(n: u64) -> u64 {
-    if n == 0 { 1 } else { 1 << (u64::BITS - n.leading_zeros()) }
-}
+fn a062383(n: u64) -> u64 { if n == 0 { 1 } else { 1 << (u64::BITS - n.leading_zeros()) } }
