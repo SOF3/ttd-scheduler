@@ -6,20 +6,20 @@ use std::ops::{AddAssign, SubAssign};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, atomic};
+use std::sync::Arc;
 
-use anyhow::Context;
 use egui::{CursorIcon, Label, Margin, TextEdit};
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
 
 mod charts;
-mod platform;
-use platform::Platform;
+pub mod platform;
+pub use platform::Platform;
 
 use crate::dispatch_flow;
-use crate::schema::{DestinationId, OrderList, read_order_list_from_path};
+use crate::schema::{DestinationId, OrderList};
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(clap::Args)]
 pub struct Command {
     pub files: Vec<PathBuf>,
@@ -38,25 +38,21 @@ struct Persist {
     changed: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Command {
     pub fn run(&self) -> anyhow::Result<()> {
-        let mut app = App {
-            platform:    Box::new(platform::Native::default()),
-            states:      States::default(),
-            fps_counter: VecDeque::new(),
-        };
-        match app.platform.read_persist_data() {
-            Ok(data) => app.states.persist.data = data,
-            Err(err) => log::error!("read persisted settings: {err:?}"),
-        }
+        use anyhow::Context;
+
+        let mut app = App::new(platform::Native::default());
         for file in &self.files {
             app.states.files.files.push(LoadedFile {
                 path:       file.clone(),
                 order_list: Box::new(
-                    read_order_list_from_path(file).context("read order list file")?,
+                    crate::schema::read_order_list_from_path(file)
+                        .context("read order list file")?,
                 ),
                 file_id:    FileId(
-                    app.states.files.next_file_id.fetch_add(1, atomic::Ordering::Relaxed),
+                    app.states.files.next_file_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 ),
             });
         }
@@ -70,11 +66,26 @@ impl Command {
     }
 }
 
-struct App {
+pub struct App {
     platform: Box<dyn Platform>,
     states:   States,
 
     fps_counter: VecDeque<f64>,
+}
+
+impl App {
+    pub fn new(platform: impl Platform + 'static) -> Self {
+        let mut app = Self {
+            platform:    Box::new(platform),
+            states:      States::default(),
+            fps_counter: VecDeque::new(),
+        };
+        match app.platform.read_persist_data() {
+            Ok(data) => app.states.persist.data = data,
+            Err(err) => log::error!("read persisted settings: {err:?}"),
+        }
+        app
+    }
 }
 
 #[derive(Default)]
@@ -85,7 +96,7 @@ struct States {
 }
 
 #[derive(Default)]
-struct FileList {
+pub struct FileList {
     files:        Vec<LoadedFile>,
     last_err:     String,
     generation:   Wrapping<u8>,
@@ -147,7 +158,7 @@ impl App {
                 self.states.files.generation += 1;
             }
 
-            let resp = ui.button("Add file");
+            let resp = ui.button("Add orderlist file");
             if !self.states.files.last_err.is_empty() {
                 ui.colored_label(egui::Color32::RED, &self.states.files.last_err);
             }

@@ -3,6 +3,7 @@ pub mod dispatch_flow;
 pub mod gui;
 pub mod schema;
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(clap::Subcommand)]
 pub enum Command {
     DispatchFlow(dispatch_flow::Command),
@@ -10,6 +11,7 @@ pub enum Command {
     Gui(gui::Command),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Command {
     pub fn run(&self) -> anyhow::Result<()> {
         match self {
