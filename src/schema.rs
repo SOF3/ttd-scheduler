@@ -9,7 +9,7 @@ use arrayvec::ArrayVec;
 use derive_more::{Add, AddAssign, Sub, SubAssign};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "type")]
 pub struct OrderList {
     pub orders:          Vec<Order>,
@@ -26,13 +26,13 @@ impl OrderList {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "type")]
 pub struct GameProperties {
     pub ticks_per_minute: Ticks,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "type")]
 pub struct Order {
     pub jump_from:      Option<JumpToken>,
@@ -41,7 +41,7 @@ pub struct Order {
     pub schedule_index: Option<usize>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "type")]
 pub enum OrderTyped {
     #[serde(rename_all = "kebab-case")]
@@ -105,7 +105,7 @@ pub struct Coords {
     pub y: u32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Schedule {
     pub duration:            Ticks,
@@ -114,11 +114,11 @@ pub struct Schedule {
     #[serde(default)]
     pub relative_start_time: Ticks,
     #[serde(default)]
-    pub route_ids:           HashMap<String, String>,
+    pub route_ids:           HashMap<Route, String>,
     pub slots:               Vec<ScheduleSlot>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ScheduleSlot {
     OffsetOnly(Ticks),
@@ -202,10 +202,10 @@ pub struct JumpToken(pub String);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Tag(pub u8);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Route(pub u8);
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[serde(tag = "condition-variable")]
 pub enum Condition {
@@ -227,7 +227,7 @@ pub enum TrueOrFalse {
     True,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SlotSource {
     Vehicle,

@@ -1,32 +1,52 @@
+use std::any::Any;
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::mem;
+use std::f32::consts::GOLDEN_RATIO;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::num::Wrapping;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::{fmt, mem};
 
 use arrayvec::ArrayVec;
+use egui::epaint::Hsva;
 use egui::text::LayoutJob;
 use egui::{
-    Align2, Color32, FontFamily, FontId, Painter, Popup, PopupKind, Pos2, Rect, ScrollArea, Slider,
-    Stroke, Vec2, pos2, vec2,
+    Align2, Color32, ComboBox, FontFamily, FontId, Painter, Popup, PopupKind, Pos2, Rect,
+    ScrollArea, SetOpenCommand, Slider, Stroke, Vec2, pos2, vec2,
 };
 use indexmap::IndexSet;
 use ordered_float::OrderedFloat;
 
-use crate::dispatch_flow::{self, DisplayInfo};
+use crate::dispatch_flow::{self, DisplayInfo, VehicleList};
 use crate::gui::{FileId, FileList, Persist, number_edit};
-use crate::schema::{self, DestinationId, Duration, OrderList, OrderTyped, Ticks, Timestamp};
+use crate::schema::{
+    self, DestinationId, Duration, OrderList, OrderTyped, Route, Ticks, Timestamp,
+};
 
 const ORDER_WRAP_THRESHOLD: f32 = 0.7;
 
 #[derive(Default)]
 pub struct State {
-    setups:        HashMap<FileId, dispatch_flow::Args>,
-    prev_setups:   HashMap<PathBuf, FileId>,
-    cache:         Option<SimulationCache>,
+    setups:      HashMap<FileId, dispatch_flow::Args>,
+    prev_setups: HashMap<PathBuf, FileId>,
+    cache:       Option<SimulationCache>,
+
     initial_texts: HashMap<(FileId, usize), String>,
-    plot:          PlotConfig,
-    hovered:       HoveredPair,
+    extra_slot:    ExtraSlotState,
+
+    plot:    PlotConfig,
+    hovered: HoveredPair,
+    palette: Palette,
+}
+
+#[derive(Default)]
+struct ExtraSlotState {
+    add_hour_text:   String,
+    add_hour_num:    u8,
+    add_minute_text: String,
+    add_minute_num:  u8,
+    route:           Option<Route>,
 }
 
 impl State {
@@ -56,10 +76,10 @@ impl State {
         ui.horizontal(|ui| {
             ui.label("Starting vehicles:");
 
-            ui.vertical(|ui| {
-                for file in &loaded.files {
+            for (file_index, file) in loaded.files.iter().enumerate() {
+                ui.vertical(|ui| {
                     let mut changed = false;
-                    for sched_index in 0..file.order_list.schedules.len() {
+                    for (sched_index, sched) in file.order_list.schedules.iter().enumerate() {
                         let setup = self.setups.get_mut(&file.file_id).expect("inserted above");
                         let initial_num = &mut setup.initial.0[sched_index];
                         let previous = *initial_num;
@@ -80,6 +100,86 @@ impl State {
                                 .entry((file.file_id, sched_index))
                                 .or_insert_with(|| initial_num.to_string());
                             number_edit(ui, text, initial_num, Some(0), Some(1000));
+
+                            let mut delete_extra_slots = Vec::new();
+                            for (extra_index, extra_slot) in
+                                setup.with_extra_slots.iter().enumerate()
+                            {
+                                if extra_slot.schedule_index == sched_index {
+                                    if ui
+                                        .colored_label(Color32::RED, "X")
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        delete_extra_slots.push(extra_index);
+                                    }
+                                    ui.label(extra_slot.slot_time.to_string()).on_hover_text(
+                                        format!(
+                                            "Route: {}",
+                                            match &extra_slot.route {
+                                                None => Cow::Borrowed("Default"),
+                                                Some(route) =>
+                                                    sched.route_ids.get(route).map_or_else(
+                                                        || format!("route {}", route.0).into(),
+                                                        |s| Cow::Borrowed(s.as_str())
+                                                    ),
+                                            }
+                                        ),
+                                    );
+                                }
+                            }
+                            let mut i = 0;
+                            setup.with_extra_slots.retain(|_| {
+                                let delete = delete_extra_slots.contains(&i);
+                                i += 1;
+                                !delete
+                            });
+
+                            ui.push_id(("extra slot", file_index, sched_index), |ui| {
+                                let add_button = ui.button("Add temp slot");
+                                Popup::from_response(&add_button)
+                                    .kind(PopupKind::Menu)
+                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                                    .open_memory(
+                                        add_button.clicked().then_some(SetOpenCommand::Bool(true)),
+                                    )
+                                    .show(|ui| {
+                                        let texts = &mut self.extra_slot;
+                                        number_edit(
+                                            ui,
+                                            &mut texts.add_hour_text,
+                                            &mut texts.add_hour_num,
+                                            Some(0),
+                                            Some(23),
+                                        );
+                                        number_edit(
+                                            ui,
+                                            &mut texts.add_minute_text,
+                                            &mut texts.add_minute_num,
+                                            Some(0),
+                                            Some(59),
+                                        );
+                                        ui.selectable_value(&mut texts.route, None, "Default");
+                                        for (&route, route_name) in sched.route_ids.iter() {
+                                            ui.selectable_value(
+                                                &mut texts.route,
+                                                Some(route),
+                                                route_name,
+                                            );
+                                        }
+                                        if ui.button("Add").clicked() {
+                                            setup.with_extra_slots.push(dispatch_flow::ExtraSlot {
+                                                schedule_index: sched_index,
+                                                slot_time:      Timestamp {
+                                                    hours:   texts.add_hour_num,
+                                                    minutes: texts.add_minute_num,
+                                                },
+                                                route:          texts.route,
+                                                tags:           ArrayVec::new(), // TODO
+                                            });
+                                        }
+                                    });
+                            });
                         });
                         changed |= *initial_num != previous;
                     }
@@ -90,8 +190,8 @@ impl State {
                         );
                         persist.changed = true;
                     }
-                }
-            });
+                });
+            }
         });
         let result = match &self.cache {
             Some(result)
@@ -115,6 +215,7 @@ impl State {
                         let setup = self.setups.get(&file.file_id).expect("inserted above");
                         match setup.simulate(&file.order_list, &mut logger) {
                             Ok(d) => {
+                                logger.vehicle_list = d.vehicles.clone();
                                 match display {
                                     Some(ref mut display) => {
                                         anyhow::ensure!(
@@ -166,16 +267,21 @@ impl State {
 
         self.plot.ui(ui, loaded, display);
 
-        type PlotFn<'a> =
-            Box<dyn Fn(&mut egui::Ui, &mut PlotConfig, &mut HoveredPair, &mut Persist) + 'a>;
+        type PlotFn<'a> = Box<
+            dyn Fn(&mut egui::Ui, &mut PlotConfig, &mut HoveredPair, &mut Persist, &mut Palette)
+                + 'a,
+        >;
         let plots: Vec<PlotFn> = [
             self.plot.stringline.then(|| {
                 Box::new(
                     |ui: &mut egui::Ui,
                      plot: &mut PlotConfig,
                      hovered: &mut HoveredPair,
-                     persist: &mut Persist| {
-                        show_stringline(ui, plot, loggers, display, loaded, hovered, persist);
+                     persist: &mut Persist,
+                     palette: &mut Palette| {
+                        show_stringline(
+                            ui, plot, loggers, display, loaded, hovered, persist, palette,
+                        );
                     },
                 ) as PlotFn
             }),
@@ -184,7 +290,8 @@ impl State {
                     |ui: &mut egui::Ui,
                      plot: &mut PlotConfig,
                      hovered: &mut HoveredPair,
-                     persist: &mut Persist| {
+                     persist: &mut Persist,
+                     _palette: &mut Palette| {
                         show_capacity(ui, loggers, plot, display, loaded, hovered, persist);
                     },
                 ) as PlotFn
@@ -195,10 +302,10 @@ impl State {
         .collect();
         match &plots[..] {
             [] => {}
-            [p1] => p1(ui, &mut self.plot, &mut self.hovered, persist),
+            [p1] => p1(ui, &mut self.plot, &mut self.hovered, persist, &mut self.palette),
             [p1, p2] => ui.columns_const(|[ui1, ui2]| {
-                p1(ui1, &mut self.plot, &mut self.hovered, persist);
-                p2(ui2, &mut self.plot, &mut self.hovered, persist);
+                p1(ui1, &mut self.plot, &mut self.hovered, persist, &mut self.palette);
+                p2(ui2, &mut self.plot, &mut self.hovered, persist, &mut self.palette);
             }),
             _ => unreachable!("we don't hae so many plots"),
         }
@@ -213,6 +320,7 @@ fn show_stringline(
     loaded: &FileList,
     hovered: &mut HoveredPair,
     persist: &mut Persist,
+    palette: &mut Palette,
 ) {
     let (galleys, galley_margin) = prepare_galleys(ui, loaded, plot_config);
 
@@ -313,11 +421,16 @@ fn show_stringline(
                 let next_coords = vehicle_step_coord(step.time)(veh_step);
                 let prev_coords = mem::replace(coords, next_coords);
 
-                let mut stroke = Stroke::new(1.0, Color32::from_rgb(180, 180, 220));
+                let mut stroke = Stroke::new(
+                    1.0,
+                    vehicle_stroke_color(vehicle, plot_config, &logger.vehicle_list, palette),
+                );
                 if let Some(hv) = hovered.prev.vehicle
                     && hv.vehicle == vehicle
                 {
-                    stroke.color = Color32::from_rgb(220, 240, 80);
+                    stroke.color =
+                        Color32::from(Hsva::new(ui.time().fract() as f32, 0.8, 0.8, 1.0));
+                    ui.request_repaint();
                 }
 
                 let cycle = resolution.num_orders as f32 * resolution.px_per_order;
@@ -601,6 +714,7 @@ struct SimulationCache {
 struct Logger {
     steps:        Vec<StepLog>,
     missed_slots: Vec<MissedSlot>,
+    vehicle_list: VehicleList,
 }
 
 impl Logger {
@@ -706,12 +820,14 @@ struct PlotConfig {
     stringline: bool,
     capacity:   bool,
 
-    orientation:   Orientation,
-    time_scale:    f32,
-    time_offset:   Ticks,
-    order_scale:   f32,
-    order_offset:  f32,
-    group_by_dest: bool,
+    orientation:  Orientation,
+    time_scale:   f32,
+    time_offset:  Ticks,
+    order_scale:  f32,
+    order_offset: f32,
+
+    group_by_dest:        bool,
+    vehicle_color_scheme: VehicleColorScheme,
 
     dest_permutation:       DestPermutation,
     override_dest_pos_once: Option<(DestinationId, f32)>,
@@ -723,12 +839,14 @@ impl Default for PlotConfig {
             stringline: true,
             capacity:   false,
 
-            orientation:   Orientation::HorizontalTime,
-            time_scale:    1.0,
-            time_offset:   Ticks(0),
-            order_scale:   1.0,
-            order_offset:  0.0,
-            group_by_dest: true,
+            orientation:  Orientation::HorizontalTime,
+            time_scale:   1.0,
+            time_offset:  Ticks(0),
+            order_scale:  1.0,
+            order_offset: 0.0,
+
+            group_by_dest:        true,
+            vehicle_color_scheme: VehicleColorScheme::StartingSchedule,
 
             dest_permutation:       DestPermutation::default(),
             override_dest_pos_once: None,
@@ -742,6 +860,28 @@ impl PlotConfig {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.group_by_dest, "Group by destination");
 
+                ComboBox::from_id_salt("VehicleColorScheme")
+                    .selected_text(self.vehicle_color_scheme.to_string())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.vehicle_color_scheme,
+                            VehicleColorScheme::OrderList,
+                            VehicleColorScheme::OrderList.to_string(),
+                        );
+                        ui.selectable_value(
+                            &mut self.vehicle_color_scheme,
+                            VehicleColorScheme::StartingSchedule,
+                            VehicleColorScheme::StartingSchedule.to_string(),
+                        );
+                        ui.selectable_value(
+                            &mut self.vehicle_color_scheme,
+                            VehicleColorScheme::Vehicle,
+                            VehicleColorScheme::Vehicle.to_string(),
+                        );
+                    });
+            });
+
+            ui.horizontal(|ui| {
                 ui.label("Time scale");
                 ui.add(Slider::new(&mut self.time_scale, 0.5..=10.0).suffix("x").logarithmic(true));
 
@@ -954,6 +1094,23 @@ enum ResolveOrder {
     Lerp(OrderRef, OrderRef, f32),
     StartBound(DestOrOrder),
     EndBound(DestOrOrder),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum VehicleColorScheme {
+    OrderList,
+    StartingSchedule,
+    Vehicle,
+}
+
+impl fmt::Display for VehicleColorScheme {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VehicleColorScheme::OrderList => write!(f, "Color by order List"),
+            VehicleColorScheme::StartingSchedule => write!(f, "Color by starting schedule"),
+            VehicleColorScheme::Vehicle => write!(f, "Color by vehicle"),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1233,4 +1390,42 @@ impl From<OrderRef> for DestOrOrder {
 struct VehicleRef {
     file_index:    usize,
     vehicle_index: usize,
+}
+
+fn vehicle_stroke_color(
+    vehicle: VehicleRef,
+    plot_config: &PlotConfig,
+    vehicle_list: &VehicleList,
+    palette: &mut Palette,
+) -> Color32 {
+    match plot_config.vehicle_color_scheme {
+        VehicleColorScheme::OrderList => hash_to_rgb(palette, vehicle.file_index),
+        VehicleColorScheme::StartingSchedule => hash_to_rgb(
+            palette,
+            (
+                vehicle.file_index,
+                vehicle_list.vehicles[vehicle.vehicle_index].starting_schedule_index,
+            ),
+        ),
+        VehicleColorScheme::Vehicle => hash_to_rgb(palette, vehicle),
+    }
+}
+
+#[derive(Default)]
+struct Palette {
+    colors: HashMap<u64, Color32>,
+}
+
+fn hash_to_rgb(palette: &mut Palette, salt: impl fmt::Debug + Hash + Any) -> Color32 {
+    let mut hasher = DefaultHasher::new();
+    salt.type_id().hash(&mut hasher);
+    salt.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    *palette.colors.entry(hash).or_insert_with(|| {
+        let hash_u16 =
+            (hash as u16) ^ ((hash >> 16) as u16) ^ ((hash >> 32) as u16) ^ ((hash >> 48) as u16);
+        let hue = GOLDEN_RATIO.fract() * (hash_u16 as f32 / u16::MAX as f32);
+        Color32::from(Hsva::new(hue.fract(), 0.65, 0.95, 1.0))
+    })
 }

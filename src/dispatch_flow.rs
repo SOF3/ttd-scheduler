@@ -4,11 +4,12 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Context as _, Result};
+use arrayvec::ArrayVec;
 use serde::{Deserialize, Serialize};
 
 use crate::schema::{
-    Condition, Duration, JumpToken, OrderList, OrderTyped, Schedule, SlotSource, Ticks, Timestamp,
-    TrueOrFalse, read_order_list_from_path,
+    Condition, Duration, JumpToken, OrderList, OrderTyped, Route, Schedule, ScheduleSlot,
+    SlotSource, Tag, Ticks, Timestamp, TrueOrFalse, read_order_list_from_path,
 };
 
 #[derive(clap::Args)]
@@ -24,7 +25,7 @@ pub struct Command {
 pub struct Args {
     /// Use this as the starting time.
     #[clap(long, value_name = "HH:MM", value_parser)]
-    pub start_time:      Option<Timestamp>,
+    pub start_time:       Option<Timestamp>,
     /// Initial number of vehicles at each schedule assignment.
     #[clap(
         long,
@@ -32,18 +33,21 @@ pub struct Args {
         value_parser,
         default_value = ""
     )]
-    pub initial:         InitialVehicles,
+    pub initial:          InitialVehicles,
     /// Duration to simulate.
     #[clap(long, default_value = "24:00", value_parser)]
-    pub simulation_time: Duration,
+    pub simulation_time:  Duration,
+    #[clap(long, value_parser, default_value = "")]
+    pub with_extra_slots: Vec<ExtraSlot>,
 }
 
 impl Default for Args {
     fn default() -> Self {
         Self {
-            start_time:      None,
-            initial:         InitialVehicles::default(),
-            simulation_time: Duration { hours: 24, minutes: 0, seconds: 0 },
+            start_time:       None,
+            initial:          InitialVehicles::default(),
+            simulation_time:  Duration { hours: 24, minutes: 0, seconds: 0 },
+            with_extra_slots: Vec::new(),
         }
     }
 }
@@ -66,6 +70,27 @@ impl FromStr for InitialVehicles {
             counts[index] = count;
         }
         Ok(Self(counts))
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtraSlot {
+    pub schedule_index: usize,
+    pub slot_time:      Timestamp,
+    pub route:          Option<Route>,
+    pub tags:           ArrayVec<Tag, 4>,
+}
+
+impl FromStr for ExtraSlot {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let (index, time) = s
+            .split_once('=')
+            .context("extra slot must be in the format <SCHEDULE_INDEX>=<HH:MM>")?;
+        let schedule_index: usize = index.parse().context("parse schedule index")?;
+        let slot_time: Timestamp = time.parse().context("parse slot time")?;
+        Ok(Self { schedule_index, slot_time, route: None, tags: ArrayVec::new() })
     }
 }
 
@@ -124,6 +149,39 @@ impl Args {
             }
             first_start
         };
+
+        let mut order_list = order_list.clone();
+        for slot in &self.with_extra_slots {
+            let insert_time = slot.slot_time.to_ticks(tpm);
+            let schedule = order_list
+                .schedules
+                .get_mut(slot.schedule_index)
+                .context("extra slot references nonexistent schedule")?;
+            let first_after =
+                schedule.slots.iter().position(|s| s.timestamp(schedule) > insert_time);
+            let insertion_index = if first_after == Some(0) {
+                // slot may be in the second cycle, see if we have earlier slots
+                if let Some(last_before) =
+                    schedule.slots.iter().rposition(|s| s.timestamp(schedule) < insert_time)
+                {
+                    last_before + 1
+                } else {
+                    // the list is empty?
+                    0
+                }
+            } else {
+                first_after.unwrap_or(0)
+            };
+            schedule.slots.insert(
+                insertion_index,
+                ScheduleSlot::Composite {
+                    offset: insert_time - schedule.relative_start_time,
+                    route:  slot.route,
+                    tags:   slot.tags.clone(),
+                },
+            )
+        }
+        let order_list = &order_list;
 
         let ctx = Context {
             order_list,
@@ -193,15 +251,37 @@ impl Args {
             tpm,
             start_time,
             end_time: start_time + self.simulation_time.to_ticks(tpm),
+            vehicles: VehicleList {
+                vehicles: state
+                    .vehicles
+                    .iter()
+                    .map(|v| VehicleInfo {
+                        starting_schedule_index:     v.starting_schedule_index,
+                        number_in_starting_schedule: v.number_in_starting_schedule,
+                    })
+                    .collect(),
+            },
         })
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct DisplayInfo {
     pub tpm:        Ticks,
     pub start_time: Ticks,
     pub end_time:   Ticks,
+    pub vehicles:   VehicleList,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VehicleList {
+    pub vehicles: Vec<VehicleInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VehicleInfo {
+    pub starting_schedule_index:     usize,
+    pub number_in_starting_schedule: u32,
 }
 
 pub trait Logger {
@@ -229,10 +309,11 @@ impl State {
         logger: &mut impl Logger,
         initial: &InitialVehicles,
     ) -> Result<()> {
+        let num_schedules = ctx.order_list.schedules.len();
         for (((schedule_index, schedule), schedule_state), &num_vehicles) in
             ctx.order_list.schedules.iter().enumerate().zip(&mut self.schedules).zip(&initial.0)
         {
-            for _ in 0..num_vehicles {
+            for vehicle_number in 0..num_vehicles {
                 let (dispatch_slot, dispatch_time) = schedule_state.next_dispatch_slot(
                     logger,
                     schedule_index,
@@ -241,13 +322,15 @@ impl State {
                 )?;
 
                 let vehicle_id = self.vehicles.len();
-                let mut schedule_slots = vec![None; schedule.slots.len()];
+                let mut schedule_slots = vec![None; num_schedules];
                 schedule_slots[schedule_index] = Some(dispatch_slot);
                 self.vehicles.push(Vehicle {
                     current_order: schedule_state.assign_order,
                     last_order: None,
                     action: VehicleAction::PendingDispatch,
                     schedule_slots,
+                    starting_schedule_index: schedule_index,
+                    number_in_starting_schedule: vehicle_number,
                 });
                 self.scheduler_heap.push((cmp::Reverse(dispatch_time), vehicle_id));
             }
@@ -351,6 +434,9 @@ pub struct Vehicle {
     pub last_order:     Option<(usize, Ticks)>,
     pub action:         VehicleAction,
     pub schedule_slots: Vec<Option<usize>>,
+
+    pub starting_schedule_index:     usize,
+    pub number_in_starting_schedule: u32,
 }
 
 pub enum VehicleAction {
