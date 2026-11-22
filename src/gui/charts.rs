@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use foldhash::{HashMap, SharedSeed, fast};
+use std::hash::{Hash, Hasher};
 use std::num::Wrapping;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -651,7 +651,7 @@ fn show_capacity(
     painter.rect_filled(resp.rect, 1.0, Color32::from_rgb(60, 80, 50));
 
     let rects: Vec<(Ticks, Ticks, DestOrOrder, u32, u32)> = if plot_config.group_by_dest {
-        let mut dest_orders = HashMap::<DestinationId, Vec<_>>::new();
+        let mut dest_orders = HashMap::<DestinationId, Vec<_>>::default();
         for (file_index, file) in loaded.files.iter().enumerate() {
             for (order_index, order) in file.order_list.orders.iter().enumerate() {
                 if let Some(dest) = order.typed.destination_id() {
@@ -1064,7 +1064,7 @@ impl PlotConfig {
         loaded: &FileList,
         rect_min: Pos2,
     ) -> Resolution {
-        let mut order_mapping = HashMap::new();
+        let mut order_mapping = HashMap::default();
         let mut counter = 0usize;
         for (file_index, file) in loaded.files.iter().enumerate() {
             for (order_index, order) in file.order_list.orders.iter().enumerate() {
@@ -1657,7 +1657,7 @@ struct Palette {
 }
 
 fn hash_to_rgb(palette: &mut Palette, salt: impl fmt::Debug + Hash + Any) -> Color32 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = fast::FoldHasher::with_seed(0, SharedSeed::global_random());
     salt.type_id().hash(&mut hasher);
     salt.hash(&mut hasher);
     let hash = hasher.finish();

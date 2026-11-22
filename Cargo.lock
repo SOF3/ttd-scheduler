@@ -3829,6 +3829,7 @@ dependencies = [
  "egui",
  "either",
  "env_logger",
+ "foldhash 0.2.0",
  "futures",
  "indexmap",
  "itertools",

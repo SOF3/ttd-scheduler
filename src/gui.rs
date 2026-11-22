@@ -1,5 +1,6 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{VecDeque};
+use foldhash::HashMap;
 use std::fmt::Display;
 use std::num::Wrapping;
 use std::ops::{AddAssign, SubAssign};

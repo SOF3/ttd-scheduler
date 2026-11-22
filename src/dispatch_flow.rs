@@ -1,5 +1,6 @@
 use std::cmp;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, };
+use foldhash::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 
