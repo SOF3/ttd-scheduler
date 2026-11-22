@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::borrow::Cow;
-use foldhash::{HashMap, SharedSeed, fast};
+use foldhash::{HashMap, HashSet, SharedSeed, fast};
 use std::hash::{Hash, Hasher};
 use std::num::Wrapping;
 use std::path::PathBuf;
@@ -394,11 +394,14 @@ fn show_stringline(
     let painter = painter.with_clip_rect(resp.rect.intersect(painter.clip_rect()));
     painter.rect_filled(resp.rect, 1.0, Color32::from_rgb(60, 80, 50));
 
+    let mut rendered = HashSet::default();
     for (&order, &offset) in &resolution.order_mapping {
-        let Some(galley) = order
-            .get(loaded)
-            .and_then(|order| order.typed.destination_name())
-            .and_then(|str| galleys.get(str).cloned())
+        let Some(order) = order.get(loaded) else { continue };
+        if let Some(dest_id) = order.typed.destination_id() && plot_config.group_by_dest && !rendered.insert(dest_id) {
+            continue;
+        }
+
+        let Some(galley) = order.typed.destination_name().and_then(|str| galleys.get(str).cloned())
         else {
             continue;
         };
