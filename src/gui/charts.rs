@@ -1309,7 +1309,7 @@ fn draw_hovered_crosshair(
     if let Some(ticks) = hovered.time {
         painter.line_segment(
             resolution.full_tick_line(plot_config, ticks),
-            Stroke::new(1.0, Color32::from_rgb(220, 130, 200)),
+            Stroke::new(1.0, Color32::from_rgb(110, 65, 100)),
         );
     }
 
