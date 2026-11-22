@@ -12,7 +12,7 @@ use egui::epaint::Hsva;
 use egui::text::LayoutJob;
 use egui::{
     Align2, Color32, ComboBox, FontFamily, FontId, Painter, Popup, PopupKind, Pos2, Rect,
-    ScrollArea, SetOpenCommand, Slider, Stroke, Vec2, pos2, vec2,
+    ScrollArea, SetOpenCommand, Slider, Stroke, Style, Vec2, pos2, vec2,
 };
 use indexmap::IndexSet;
 use ordered_float::OrderedFloat;
@@ -477,7 +477,7 @@ fn show_stringline(
 
                 let mut stroke = Stroke::new(
                     1.0,
-                    vehicle_stroke_color(vehicle, plot_config, &logger.vehicle_list, palette),
+                    vehicle_stroke_color(vehicle, plot_config, &logger.vehicle_list, step, palette),
                 );
                 if let Some(hv) = hovered.prev.vehicle
                     && hv.vehicle == vehicle
@@ -553,6 +553,7 @@ fn show_stringline(
     detect_hover(&resp, hovered, plot_config, &resolution, persist);
     show_tooltip(
         &resp,
+        ui.style(),
         &hovered.prev,
         loaded,
         display,
@@ -560,14 +561,25 @@ fn show_stringline(
         &resolution,
         nearest_hovered_segment.is_some(),
         |ui: &mut egui::Ui| {
-            let Some((_, hovered)) = nearest_hovered_segment else { return };
-            let order_list = &*loaded.files[hovered.vehicle.file_index].order_list;
+            let Some((_, hovered_segment)) = nearest_hovered_segment else { return };
+            let file = &loaded.files[hovered_segment.vehicle.file_index];
+            let logger = &loggers[hovered_segment.vehicle.file_index];
+            if let Some(hovered_time) = hovered.prev.time
+                && let Some(step) = logger.binary_search_step(hovered_time)
+            {
+                ui.label(format!(
+                    "Last dispatched {} sched#{}",
+                    file.path.display(),
+                    step.vehicles[hovered_segment.vehicle.vehicle_index].last_dispatch_schedule + 1,
+                ));
+            }
+            let order_list = &*file.order_list;
             let next = order_list
                 .orders
-                .get(hovered.next_order)
+                .get(hovered_segment.next_order)
                 .and_then(|o| o.typed.destination_name())
                 .unwrap_or("Unknown");
-            match hovered.prev_order {
+            match hovered_segment.prev_order {
                 None => {
                     ui.label(format!("Waiting at {next}"));
                 }
@@ -756,6 +768,7 @@ fn show_capacity(
     detect_hover(&resp, hovered, plot_config, &resolution, persist);
     show_tooltip(
         &resp,
+        ui.style(),
         &hovered.prev,
         loaded,
         display,
@@ -796,8 +809,9 @@ struct StepLog {
 }
 
 struct VehicleStepLog {
-    current_order:   usize,
-    lerp_last_order: Option<(usize, f32)>,
+    current_order:          usize,
+    lerp_last_order:        Option<(usize, f32)>,
+    last_dispatch_schedule: usize,
 }
 
 #[derive(Clone)]
@@ -843,16 +857,17 @@ impl dispatch_flow::Logger for Logger {
             .vehicles
             .iter()
             .map(|vehicle| VehicleStepLog {
-                current_order:   vehicle.current_order,
-                lerp_last_order: vehicle.last_order.and_then(|(order, start)| {
-                    match vehicle.action {
-                        dispatch_flow::VehicleAction::Traveling { eta } => {
-                            let lerp = (time - start).0 as f32 / (eta - start).0 as f32;
-                            Some((order, lerp))
-                        }
-                        _ => None,
+                current_order:          vehicle.current_order,
+                lerp_last_order:        vehicle.last_order.and_then(|(order, start)| match vehicle
+                    .action
+                {
+                    dispatch_flow::VehicleAction::Traveling { eta } => {
+                        let lerp = (time - start).0 as f32 / (eta - start).0 as f32;
+                        Some((order, lerp))
                     }
+                    _ => None,
                 }),
+                last_dispatch_schedule: vehicle.last_dispatch_schedule,
             })
             .collect();
 
@@ -948,7 +963,7 @@ impl Default for PlotConfig {
             time_ticks_density: 10,
 
             group_by_dest:        true,
-            vehicle_color_scheme: VehicleColorScheme::StartingSchedule,
+            vehicle_color_scheme: VehicleColorScheme::LastDispatchSchedule,
 
             dest_permutation:       DestPermutation::default(),
             override_dest_pos_once: None,
@@ -980,6 +995,11 @@ impl PlotConfig {
                             &mut self.vehicle_color_scheme,
                             VehicleColorScheme::StartingSchedule,
                             VehicleColorScheme::StartingSchedule.to_string(),
+                        );
+                        ui.selectable_value(
+                            &mut self.vehicle_color_scheme,
+                            VehicleColorScheme::LastDispatchSchedule,
+                            VehicleColorScheme::LastDispatchSchedule.to_string(),
                         );
                         ui.selectable_value(
                             &mut self.vehicle_color_scheme,
@@ -1211,6 +1231,7 @@ enum ResolveOrder {
 enum VehicleColorScheme {
     OrderList,
     StartingSchedule,
+    LastDispatchSchedule,
     Vehicle,
 }
 
@@ -1219,6 +1240,9 @@ impl fmt::Display for VehicleColorScheme {
         match self {
             VehicleColorScheme::OrderList => write!(f, "Color by order List"),
             VehicleColorScheme::StartingSchedule => write!(f, "Color by starting schedule"),
+            VehicleColorScheme::LastDispatchSchedule => {
+                write!(f, "Color by last dispatch schedule")
+            }
             VehicleColorScheme::Vehicle => write!(f, "Color by vehicle"),
         }
     }
@@ -1371,6 +1395,7 @@ struct DndPayload {
 
 fn show_tooltip(
     resp: &egui::Response,
+    style: &Style,
     hovered: &Hovered,
     loaded: &FileList,
     display: &DisplayInfo,
@@ -1395,6 +1420,11 @@ fn show_tooltip(
         .kind(PopupKind::Tooltip)
         .sense(egui::Sense::empty())
         .at_position(pos)
+        .frame({
+            let mut frame = egui::Frame::popup(style);
+            frame.fill = frame.fill.gamma_multiply(0.5);
+            frame
+        })
         .show(|ui| {
             ui.set_min_width(200.0);
             if let Some(time) = hovered.time {
@@ -1594,6 +1624,7 @@ fn vehicle_stroke_color(
     vehicle: VehicleRef,
     plot_config: &PlotConfig,
     vehicle_list: &VehicleList,
+    step: &StepLog,
     palette: &mut Palette,
 ) -> Color32 {
     match plot_config.vehicle_color_scheme {
@@ -1604,6 +1635,10 @@ fn vehicle_stroke_color(
                 vehicle.file_index,
                 vehicle_list.vehicles[vehicle.vehicle_index].starting_schedule_index,
             ),
+        ),
+        VehicleColorScheme::LastDispatchSchedule => hash_to_rgb(
+            palette,
+            (vehicle.file_index, step.vehicles[vehicle.vehicle_index].last_dispatch_schedule),
         ),
         VehicleColorScheme::Vehicle => hash_to_rgb(palette, vehicle),
     }

@@ -124,6 +124,7 @@ impl Args {
     ) -> Result<DisplayInfo> {
         let tpm = order_list.game_properties.ticks_per_minute;
         let day_length = tpm * 1440;
+        anyhow::ensure!(day_length > Ticks(0), "ticks per minute must be positive");
 
         for (i, schedule) in order_list.schedules.iter().enumerate() {
             anyhow::ensure!(
@@ -157,29 +158,26 @@ impl Args {
                 .schedules
                 .get_mut(slot.schedule_index)
                 .context("extra slot references nonexistent schedule")?;
-            let first_after =
-                schedule.slots.iter().position(|s| s.timestamp(schedule) > insert_time);
-            let insertion_index = if first_after == Some(0) {
-                // slot may be in the second cycle, see if we have earlier slots
-                if let Some(last_before) =
-                    schedule.slots.iter().rposition(|s| s.timestamp(schedule) < insert_time)
-                {
-                    last_before + 1
-                } else {
-                    // the list is empty?
-                    0
+            schedule.slots.push(ScheduleSlot::Composite {
+                offset: insert_time - schedule.relative_start_time,
+                route:  slot.route,
+                tags:   slot.tags.clone(),
+            });
+        }
+        for schedule in &mut order_list.schedules {
+            for slot in &mut schedule.slots {
+                let offset = match slot {
+                    ScheduleSlot::OffsetOnly(offset) | ScheduleSlot::Composite { offset, .. } => {
+                        offset
+                    }
+                };
+                offset.0 = offset.0.rem_euclid(schedule.duration.0);
+            }
+            schedule.slots.sort_by_key(|slot| match slot {
+                ScheduleSlot::OffsetOnly(offset) | ScheduleSlot::Composite { offset, .. } => {
+                    *offset
                 }
-            } else {
-                first_after.unwrap_or(0)
-            };
-            schedule.slots.insert(
-                insertion_index,
-                ScheduleSlot::Composite {
-                    offset: insert_time - schedule.relative_start_time,
-                    route:  slot.route,
-                    tags:   slot.tags.clone(),
-                },
-            )
+            });
         }
         let order_list = &order_list;
 
@@ -200,29 +198,36 @@ impl Args {
                 .iter()
                 .enumerate()
                 .map(|(index, schedule)| {
+                    let (next_dispatch_slot, dispatch_slot_cycles) = schedule
+                        .slots
+                        .iter()
+                        .enumerate()
+                        .map(|(slot, data)| {
+                            let timestamp = data.timestamp(schedule);
+                            let cycles = (start_time.0 - timestamp.0).div_euclid(day_length.0);
+                            let cycle_offset = Ticks(cycles * day_length.0);
+                            let cycle_offset = if timestamp + cycle_offset < start_time {
+                                cycle_offset + day_length
+                            } else {
+                                cycle_offset
+                            };
+                            (slot, cycle_offset)
+                        })
+                        .min_by_key(|&(slot, cycle_offset)| {
+                            schedule.slots[slot].timestamp(schedule) + cycle_offset
+                        })
+                        .unwrap_or((0, Ticks(0)));
                     Ok(ScheduleState {
-                        assign_order:         order_list
+                        assign_order: order_list
                             .orders
                             .iter()
                             .position(|order| order.schedule_index == Some(index))
                             .with_context(|| {
                                 format!("schedule {} not assigned to any order", index + 1)
                             })?,
-                        next_dispatch_slot:   schedule
-                            .slots
-                            .iter()
-                            .enumerate()
-                            .map(|(slot, data)| {
-                                (
-                                    slot,
-                                    data.timestamp(schedule).mod_start_time(start_time, day_length),
-                                )
-                            })
-                            .min_by_key(|&(_, timestamp)| timestamp)
-                            .map(|(slot, _)| slot)
-                            .unwrap_or(0),
-                        dispatch_slot_cycles: Ticks(0),
-                        last_dispatch_time:   None,
+                        next_dispatch_slot,
+                        dispatch_slot_cycles,
+                        last_dispatch_time: None,
                     })
                 })
                 .collect::<Result<_>>()?,
@@ -344,6 +349,7 @@ impl State {
                     schedule_slots,
                     starting_schedule_index: schedule_index,
                     number_in_starting_schedule: vehicle_number,
+                    last_dispatch_schedule: schedule_index,
                 });
                 self.scheduler_heap.push((cmp::Reverse(dispatch_time), vehicle_id));
             }
@@ -380,6 +386,7 @@ impl State {
                         .next_dispatch_slot(logger, schedule_index, schedule, current_time)
                         .context("acquire next dispatch slot")?;
                     vehicle.schedule_slots[schedule_index] = Some(slot_index);
+                    vehicle.last_dispatch_schedule = schedule_index;
 
                     (eta, VehicleAction::PendingDispatch)
                 } else {
@@ -426,19 +433,14 @@ impl ScheduleState {
         anyhow::ensure!(num_slots > 0, "schedule has no slots and cannot dispatch vehicles");
         loop {
             let slot = self.next_dispatch_slot;
+            let dispatch_time =
+                schedule.slots[slot].timestamp(schedule) + self.dispatch_slot_cycles;
             self.next_dispatch_slot += 1;
             if self.next_dispatch_slot >= num_slots {
                 self.next_dispatch_slot = 0;
+                self.dispatch_slot_cycles += schedule.duration;
             }
 
-            let slot_data = &schedule.slots[slot];
-            let mut dispatch_time = slot_data.timestamp(schedule) + self.dispatch_slot_cycles;
-            if let Some(last) = self.last_dispatch_time
-                && dispatch_time <= last
-            {
-                self.dispatch_slot_cycles += schedule.duration;
-                dispatch_time += schedule.duration;
-            }
             self.last_dispatch_time = Some(dispatch_time);
             if dispatch_time + schedule.max_delay >= current_time {
                 return Ok((slot, dispatch_time.max(current_time)));
@@ -457,6 +459,7 @@ pub struct Vehicle {
 
     pub starting_schedule_index:     usize,
     pub number_in_starting_schedule: u32,
+    pub last_dispatch_schedule:      usize,
 }
 
 pub enum VehicleAction {
