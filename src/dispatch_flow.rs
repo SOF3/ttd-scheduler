@@ -350,6 +350,7 @@ impl State {
                     starting_schedule_index: schedule_index,
                     number_in_starting_schedule: vehicle_number,
                     last_dispatch_schedule: schedule_index,
+                    last_dispatch_time: dispatch_time,
                 });
                 self.scheduler_heap.push((cmp::Reverse(dispatch_time), vehicle_id));
             }
@@ -387,6 +388,7 @@ impl State {
                         .context("acquire next dispatch slot")?;
                     vehicle.schedule_slots[schedule_index] = Some(slot_index);
                     vehicle.last_dispatch_schedule = schedule_index;
+                    vehicle.last_dispatch_time = eta;
 
                     (eta, VehicleAction::PendingDispatch)
                 } else {
@@ -460,6 +462,7 @@ pub struct Vehicle {
     pub starting_schedule_index:     usize,
     pub number_in_starting_schedule: u32,
     pub last_dispatch_schedule:      usize,
+    pub last_dispatch_time:          Ticks,
 }
 
 pub enum VehicleAction {

@@ -567,11 +567,16 @@ fn show_stringline(
             if let Some(hovered_time) = hovered.prev.time
                 && let Some(step) = logger.binary_search_step(hovered_time)
             {
-                ui.label(format!(
-                    "Last dispatched {} sched#{}",
-                    file.path.display(),
-                    step.vehicles[hovered_segment.vehicle.vehicle_index].last_dispatch_schedule + 1,
-                ));
+                let step_vehicle = &step.vehicles[hovered_segment.vehicle.vehicle_index];
+                if let Ok(timestamp) =
+                    Timestamp::from_ticks(step_vehicle.last_dispatch_time, display.tpm)
+                {
+                    ui.label(format!(
+                        "Last dispatched {} sched#{} at {timestamp}",
+                        file.path.display(),
+                        step_vehicle.last_dispatch_schedule + 1,
+                    ));
+                }
             }
             let order_list = &*file.order_list;
             let next = order_list
@@ -812,6 +817,7 @@ struct VehicleStepLog {
     current_order:          usize,
     lerp_last_order:        Option<(usize, f32)>,
     last_dispatch_schedule: usize,
+    last_dispatch_time:     Ticks,
 }
 
 #[derive(Clone)]
@@ -868,6 +874,7 @@ impl dispatch_flow::Logger for Logger {
                     _ => None,
                 }),
                 last_dispatch_schedule: vehicle.last_dispatch_schedule,
+                last_dispatch_time:     vehicle.last_dispatch_time,
             })
             .collect();
 
